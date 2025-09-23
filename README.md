@@ -7,7 +7,7 @@ Fast batched K-Means clustering implemented with Triton GPU kernels.
 Clone the repository and install in editable mode:
 
 ```bash
-git clone https://github.com/yourname/flash-kmeans.git
+git clone https://github.com/svg-project/flash-kmeans.git
 cd flash-kmeans
 pip install -e .
 ```
