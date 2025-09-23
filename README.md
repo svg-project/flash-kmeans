@@ -19,7 +19,7 @@ import torch
 from flash_kmeans import batch_kmeans_Euclid
 
 x = torch.randn(32, 75600, 128, device="cuda", dtype=torch.float16)
-cluster_ids, centers, _ = batch_kmeans_Euclid(x, n_clusters=1000, verbose=True)
+cluster_ids, centers, _ = batch_kmeans_Euclid(x, n_clusters=1000, tol=1e-4, verbose=True)
 ```
 
 

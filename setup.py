@@ -9,8 +9,9 @@ setup(
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[
-        "torch>=1.13",
+        "torch>=2.0",
         "triton>=2.0",  # NVIDIA Triton language package
+        "numpy",
         "tqdm",
     ],
     classifiers=[

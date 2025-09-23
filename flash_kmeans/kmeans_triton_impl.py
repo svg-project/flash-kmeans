@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover
     _cosine_iter_compiled = _cosine_iter
     _dot_iter_compiled    = _dot_iter
 
-def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=None, verbose=False):
+def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
     """
     Batched KMeans clustering in PyTorch using Euclidean distance.
 
@@ -89,14 +89,14 @@ def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=N
         # 4. Check for convergence
         if verbose:
             print(f"Iter {it}, center shift: {center_shift.item():.6f}")
-        # if center_shift < tol:
-        #     break
+        if center_shift < tol:
+            break
         centroids = centroids_new.clone()
 
     return cluster_ids, centroids, it + 1
 
 
-def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=None, verbose=False):
+def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
     """
     Batched KMeans clustering in PyTorch using Cosine similarity.
 
@@ -136,14 +136,14 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=N
         # 4. Check for convergence
         if verbose:
             print(f"Iter {it}, center shift: {center_shift.item():.6f}")
-        # if center_shift < tol:
-        #     break
+        if center_shift < tol:
+            break
         centroids = centroids_new.clone()
 
     return cluster_ids, centroids, it + 1
 
 
-def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=None, verbose=False):
+def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
     """
     Batched KMeans clustering in PyTorch using raw dot-product as similarity.
 
@@ -170,8 +170,8 @@ def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=None
         # 4. Check for convergence
         if verbose:
             print(f"Iter {it} (dot), center shift: {center_shift.item():.6f}")
-        # if center_shift < tol:
-        #     break
+        if center_shift < tol:
+            break
         centroids = centroids_new.clone()
 
     return cluster_ids, centroids, it + 1
