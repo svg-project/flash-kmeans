@@ -1,9 +1,8 @@
 import torch
 import torch.nn.functional as F
 from torch.cuda import nvtx
-from kmeans.dist_argmin_triton import dist_argmin_triton
-from kmeans.assign_euclid_triton import euclid_assign_triton
-from kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid
+from flash_kmeans.assign_euclid_triton import euclid_assign_triton
+from flash_kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid
 from tqdm import trange
 
 # -------------------- Compiled single-iteration kernels --------------------
@@ -11,13 +10,7 @@ from tqdm import trange
 # 1. Euclidean
 def _euclid_iter(x, x_sq, centroids):
     
-    # cent_sq = (centroids ** 2).sum(dim=-1)
-    # cross = torch.einsum('bnd,bkd->bnk', x, centroids)
-    # dist_sq = (x_sq[:,:,None] + cent_sq[:,None,:] - 2.0 * cross).clamp_min_(0.0)
-    # cluster_ids = dist_sq.argmin(dim=-1)
-    # cluster_ids = dist_argmin_triton(cross, x_sq, cent_sq)
     cluster_ids = euclid_assign_triton(x, centroids, x_sq)
-    # centroids_new = triton_centroid_update_euclid(x, cluster_ids, centroids)
     centroids_new = triton_centroid_update_sorted_euclid(x, cluster_ids, centroids)
 
     shift = (centroids_new - centroids).norm(dim=-1).max()
@@ -43,7 +36,6 @@ def _dot_iter(x, centroids):
 
 COMPILE_FLAG = False
 
-# 尝试编译；若 PyTorch < 2.0 或 compile 不可用则退化为原函数
 try:
     if COMPILE_FLAG:
         _euclid_iter_compiled = torch.compile(_euclid_iter, dynamic=True, mode="reduce-overhead")
@@ -246,17 +238,3 @@ if __name__ == "__main__":
     dot_time_per_iter = dot_time / n_iters_dot
     print(f"Dot-Product K-Means: {dot_time:.2f} ms per run, total {n_iters_dot} iterations, {dot_time_per_iter:.2f} ms per iter")
     print(f"Dot-Product TFLOPS: {2 * B * N * D * n_clusters * n_iters_dot / dot_time / 1e12:.2f}")
-
-    # # Speed comparison
-    # if euclid_time > cosine_time:
-    #     speedup = euclid_time / cosine_time
-    #     print(f"Cosine K-Means is {speedup:.2f}x FASTER than Euclidean K-Means")
-    # else:
-    #     speedup = cosine_time / euclid_time
-    #     print(f"Euclidean K-Means is {speedup:.2f}x FASTER than Cosine K-Means")
-
-    # # Memory usage comparison
-    # print(f"\n=== Memory Usage Analysis ===")
-    # print(f"Input tensor size: {x.numel() * x.element_size() / 1024**2:.2f} MB")
-    # print("Euclidean: Uses torch.norm() which creates intermediate tensors")
-    # print("Cosine: Uses einsum() and normalization, more memory efficient")
