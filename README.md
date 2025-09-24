@@ -1,4 +1,4 @@
-# flash-kmeans
+# Flash-KMeans
 
 Fast batched K-Means clustering implemented with Triton GPU kernels.
 
