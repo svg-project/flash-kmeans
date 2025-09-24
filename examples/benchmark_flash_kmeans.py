@@ -2,6 +2,7 @@ import torch
 from flash_kmeans import batch_kmeans_Euclid
 from flash_kmeans.centroid_update_triton import triton_centroid_update_euclid
 import time
+import argparse
 
 def _euclid_iter_torch(x, x_sq, centroids):
     cent_sq = (centroids ** 2).sum(dim=-1)
@@ -90,17 +91,22 @@ def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
     return (end - start) / 10 * 1000
 
 if __name__ == "__main__":
-    b = 32
-    n = 74256
-    d = 128
-    k = 1000
-    max_iters = 100
-    tol = -1
-    print("torch kmeans baseline")
-    torch_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_torch, max_iters=max_iters, tol=tol)
-    print(f"torch kmeans baseline time for {b}x{n}x{d}x{k} with {max_iters} iterations: {torch_time} ms")
-    print(f"torch kmeans baseline for 1 iteration: {torch_time / max_iters} ms")
-    print()
+    parser = argparse.ArgumentParser(description="Benchmark KMeans implementations")
+    parser.add_argument("--batch-size", "-b", type=int, default=32, help="Batch size")
+    parser.add_argument("--num-points", "-n", type=int, default=74256, help="Number of points per batch")
+    parser.add_argument("--dim", "-d", type=int, default=128, help="Dimensionality of points")
+    parser.add_argument("--num-clusters", "-k", type=int, default=1000, help="Number of clusters")
+    parser.add_argument("--max-iters", type=int, default=100, help="Maximum number of iterations")
+    parser.add_argument("--tol", type=float, default=-1, help="Tolerance for center movement; negative disables early stopping")
+    args = parser.parse_args()
+
+    b = args.batch_size
+    n = args.num_points
+    d = args.dim
+    k = args.num_clusters
+    max_iters = args.max_iters
+    tol = args.tol
+
     if batch_kmeans_Euclid_fast_torch is not None:
         print("fast_pytorch_kmeans")
         fast_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_fast_torch, max_iters=max_iters, tol=tol)
@@ -109,6 +115,11 @@ if __name__ == "__main__":
     else:
         print("fast_pytorch_kmeans is not installed")
         print("Skipping fast_pytorch_kmeans benchmark")
+    print()
+    print("batched torch kmeans")
+    torch_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_torch, max_iters=max_iters, tol=tol)
+    print(f"batched torch kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {torch_time} ms")
+    print(f"batched torch kmeans for 1 iteration: {torch_time / max_iters} ms")
     print()
     print("flash_kmeans")
     flash_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid, max_iters=max_iters, tol=tol)

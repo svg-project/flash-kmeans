@@ -22,6 +22,12 @@ x = torch.randn(32, 75600, 128, device="cuda", dtype=torch.float16)
 cluster_ids, centers, _ = batch_kmeans_Euclid(x, n_clusters=1000, tol=1e-4, verbose=True)
 ```
 
+## Benchmark
+
+Our Triton implementation brings significant performance improvements. Compared with a standard PyTorch [baseline](https://github.com/DeMoriarty/fast_pytorch_kmeans), it achieves **up to 16× speed-up** on an NVIDIA H100 GPU (FP16, batch size 32, 16k points, 128-D, 1k clusters).
+
+![Benchmark result](assets/flash_kmeans_per_iter.png)
+
 
 ## Citation
 
