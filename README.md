@@ -1,12 +1,6 @@
 # Flash-KMeans
 
-Fast batched K-Means clustering implemented with Triton GPU kernels. 
-
-<p align="center">
-  <img src="assets/logo_small.png" alt="LOGO" width="300"/>
-</p>
-
-This repository provides the official K-Means implementation of [Sparse VideoGen2](https://arxiv.org/pdf/2505.18875).
+Fast batched K-Means clustering implemented with Triton GPU kernels. This repository provides the official K-Means implementation of [Sparse VideoGen2](https://arxiv.org/pdf/2505.18875).
 
 ![Teasor](assets/ClusterWorkflow.png)
 
