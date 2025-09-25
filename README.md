@@ -2,9 +2,9 @@
 
 Fast batched K-Means clustering implemented with Triton GPU kernels. 
 
-<div style="text-align: center;">
-    <img src="assets/LOGO.png" alt="LOGO" style="width: 300px;">
-</div>
+<p align="center">
+  <img src="assets/LOGO.png" alt="LOGO" width="300"/>
+</p>
 
 This repository provides the official K-Means implementation of [Sparse VideoGen2](https://arxiv.org/pdf/2505.18875).
 
