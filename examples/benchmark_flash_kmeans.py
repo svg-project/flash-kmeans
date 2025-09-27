@@ -69,7 +69,7 @@ try:
         for i in range(x.shape[0]):
             labels = kmeans.fit_predict(x[i])
             all_labels.append(labels)
-            labels = torch.stack(all_labels)
+        labels = torch.stack(all_labels)
         return labels, None, None
 except ImportError:
     print("fast_pytorch_kmeans is not installed")
