@@ -8,3 +8,5 @@ __all__ = [
     "triton_centroid_update_euclid",
     "triton_centroid_update_sorted_euclid",
 ]
+
+__version__ = "0.1.0"

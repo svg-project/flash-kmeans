@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-kmeans"
+version = "0.1.0"
+description = "Fast batched K-Means clustering with Triton GPU kernels"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+  { name = "Shuo Yang", email = "andy_yang@berkeley.edu" }
+]
+license = { file = "LICENSE.txt" }
+keywords = ["kmeans", "gpu", "triton", "clustering", "pytorch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.0",
+  "triton>=2.0",
+  "numpy",
+  "tqdm"
+]
+
+[project.urls]
+Homepage = "https://github.com/svg-project/flash-kmeans"
+BugTracker = "https://github.com/svg-project/flash-kmeans/issues"
+Source = "https://github.com/svg-project/flash-kmeans"
+
+[tool.setuptools]
+packages = ["flash_kmeans"]
+
+[tool.setuptools.package-data]
+# Include any Triton kernels or additional runtime data if needed
+flash_kmeans = ["kernels/*"]
