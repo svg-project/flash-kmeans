@@ -11,48 +11,47 @@ def _ceil_div(a: int, b: int) -> int:
 
 @triton.jit
 def _centroid_update_kernel(
-    x_ptr,                # *f16  [B, N, D]
-    cluster_ptr,          # *i32  [B, N]
-    sum_ptr,              # *f32  [B, K, D]
-    count_ptr,            # *i32  [B, K]
+    x_ptr,                # *f16 / *f32 [B, N, D]
+    cluster_ptr,          # *i32        [B, N]
+    sum_ptr,              # *f32        [B, K, D]
+    count_ptr,            # *i32        [B, K]
+    # --- strides (elements) ---
+    stride_x_b, stride_x_n, stride_x_d,
+    stride_sum_b, stride_sum_k, stride_sum_d,
+    stride_count_b, stride_count_k,
     B: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
     K: tl.constexpr,
     BLOCK_D: tl.constexpr,   # number of dims processed per program
 ):
-    """Each program processes 1 point (token) across BLOCK_D dimensions with atomics."""
+    """Each program processes 1 token across BLOCK_D dims using atomics with general strides."""
     pid = tl.program_id(axis=0)
-    token_idx = pid  # range: [0, B * N)
+    token_idx = pid  # range: [0, B*N)
 
-    # Derive (b, n) indices
+    # Derive (b, n)
     b = token_idx // N
     n = token_idx % N
 
-    # Pointers to the token features and its cluster id
-    x_offset = (b * N + n) * D
-    x_ptr = x_ptr + x_offset
+    # pointer to this token's feature vector
+    x_offset = b * stride_x_b + n * stride_x_n
+    x_tok_ptr = x_ptr + x_offset
 
-    cluster_idx = tl.load(cluster_ptr + b * N + n)  # int32
-
-    # Guard for invalid cluster ids (should not happen)
+    cluster_idx = tl.load(cluster_ptr + b * N + n)
     cluster_idx = tl.where(cluster_idx < K, cluster_idx, 0)
 
-    # Base pointer for this centroid in the output sum tensor
-    centroid_base = (b * K + cluster_idx) * D
+    # base ptr for centroid accum array
+    centroid_base = b * stride_sum_b + cluster_idx * stride_sum_k
 
-    # Process feature vector in chunks of BLOCK_D
     offs = tl.arange(0, BLOCK_D)
     for d_start in range(0, D, BLOCK_D):
         mask = offs + d_start < D
-        feats = tl.load(x_ptr + d_start + offs, mask=mask, other=0.0)
+        feats = tl.load(x_tok_ptr + (d_start + offs) * stride_x_d, mask=mask, other=0.0)
         feats = feats.to(tl.float32)
-
-        dest_ptr = sum_ptr + centroid_base + d_start + offs
+        dest_ptr = sum_ptr + centroid_base + (d_start + offs) * stride_sum_d
         tl.atomic_add(dest_ptr, feats, mask=mask)
 
-    # Update counts (only once per point)
-    tl.atomic_add(count_ptr + b * K + cluster_idx, 1)
+    tl.atomic_add(count_ptr + b * stride_count_b + cluster_idx * stride_count_k, 1)
 
 
 def triton_centroid_update_cosine(x_norm: torch.Tensor, cluster_ids: torch.Tensor, old_centroids: torch.Tensor):
@@ -85,6 +84,9 @@ def triton_centroid_update_cosine(x_norm: torch.Tensor, cluster_ids: torch.Tenso
         cluster_ids.to(torch.int32),
         centroid_sums,
         centroid_counts,
+        x_norm.stride(0), x_norm.stride(1), x_norm.stride(2),
+        centroid_sums.stride(0), centroid_sums.stride(1), centroid_sums.stride(2),
+        centroid_counts.stride(0), centroid_counts.stride(1),
         B, N, D, K,
         BLOCK_D=BLOCK_D,
     )
@@ -146,6 +148,9 @@ def triton_centroid_update_euclid(x: torch.Tensor, cluster_ids: torch.Tensor, ol
         cluster_ids.to(torch.int32),
         centroid_sums,
         centroid_counts,
+        x.stride(0), x.stride(1), x.stride(2),
+        centroid_sums.stride(0), centroid_sums.stride(1), centroid_sums.stride(2),
+        centroid_counts.stride(0), centroid_counts.stride(1),
         B, N, D, K,
         BLOCK_D=BLOCK_D,
     )
@@ -170,6 +175,11 @@ def _centroid_update_chunk_kernel(
     sorted_cluster_ptr,   # *i32        [B, N]    – cluster ids in sorted order
     sum_ptr,              # *f32        [B, K, D]
     count_ptr,            # *i32        [B, K]
+    # strides
+    stride_x_b, stride_x_n, stride_x_d,
+    stride_idx_b, stride_idx_n, stride_cluster_b, stride_cluster_n,
+    stride_sum_b, stride_sum_k, stride_sum_d,
+    stride_count_b, stride_count_k,
     B: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
@@ -195,9 +205,9 @@ def _centroid_update_chunk_kernel(
         return
 
     # base pointers for this batch
-    idx_batch_base     = sorted_idx_ptr + b * N
-    cid_batch_base     = sorted_cluster_ptr + b * N
-    x_batch_base       = x_ptr + b * N * D  # for pointer arithmetic
+    idx_batch_base     = sorted_idx_ptr + b * stride_idx_b
+    cid_batch_base     = sorted_cluster_ptr + b * stride_cluster_b
+    x_batch_base       = x_ptr + b * stride_x_b  # for pointer arithmetic
 
     # helper aranges
     offs_token = tl.arange(0, BLOCK_N)
@@ -212,9 +222,9 @@ def _centroid_update_chunk_kernel(
     # Load first cluster id to initialise the running accumulator
     first_id = tl.load(cid_batch_base + first_token_idx)
     last_id = tl.load(cid_batch_base + last_token_idx)
-    all_ids = tl.load(cid_batch_base + token_idx, mask=valid_tok, other=-1)
+    all_ids = tl.load(cid_batch_base + token_idx * stride_cluster_n, mask=valid_tok, other=-1)
 
-    all_tokens_idxs = tl.load(idx_batch_base + token_idx, mask=valid_tok, other=-1) # [BLOCK_N]
+    all_tokens_idxs = tl.load(idx_batch_base + token_idx * stride_idx_n, mask=valid_tok, other=-1) # [BLOCK_N]
 
     load_mask = all_tokens_idxs[:,None] * D + offs_dim[None,:]
 
@@ -222,12 +232,13 @@ def _centroid_update_chunk_kernel(
         cluster_mask = all_ids == cid
         cluster_size = tl.sum(cluster_mask.to(tl.int32))
         if cluster_size != 0:
-            cluster_feats = tl.load(x_batch_base + load_mask, mask=cluster_mask[:,None], other=0.0) # [BLOCK_N, D]
+            row_ptrs = x_batch_base + all_tokens_idxs[:,None]*stride_x_n + offs_dim[None,:]*stride_x_d
+            cluster_feats = tl.load(row_ptrs, mask=cluster_mask[:,None], other=0.0) # [BLOCK_N, D]
             cluster_feats = cluster_feats.to(tl.float32)
             sum_feats = tl.sum(cluster_feats, axis=0)
-            dest_ptr = sum_ptr + (b * K + cid) * D + offs_dim
+            dest_ptr = sum_ptr + b*stride_sum_b + cid*stride_sum_k + offs_dim*stride_sum_d
             tl.atomic_add(dest_ptr, sum_feats)
-            tl.atomic_add(count_ptr + b * K + cid, cluster_size)
+            tl.atomic_add(count_ptr + b*stride_count_b + cid*stride_count_k, cluster_size)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -261,6 +272,11 @@ def triton_centroid_update_sorted_cosine(x_norm: torch.Tensor, cluster_ids: torc
         sorted_cluster_ids.to(torch.int32),
         centroid_sums,
         centroid_cnts,
+        x_norm.stride(0), x_norm.stride(1), x_norm.stride(2),
+        sorted_idx_int.stride(0), sorted_idx_int.stride(1),
+        sorted_cluster_ids.stride(0), sorted_cluster_ids.stride(1),
+        centroid_sums.stride(0), centroid_sums.stride(1), centroid_sums.stride(2),
+        centroid_cnts.stride(0), centroid_cnts.stride(1),
         B, N, D, K,
         BLOCK_N=BLOCK_N,
     )
@@ -307,6 +323,11 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
         sorted_cluster_ids.to(torch.int32),
         centroid_sums,
         centroid_cnts,
+        x.stride(0), x.stride(1), x.stride(2),
+        sorted_idx_int.stride(0), sorted_idx_int.stride(1),
+        sorted_cluster_ids.stride(0), sorted_cluster_ids.stride(1),
+        centroid_sums.stride(0), centroid_sums.stride(1), centroid_sums.stride(2),
+        centroid_cnts.stride(0), centroid_cnts.stride(1),
         B, N, D, K,
         BLOCK_N=BLOCK_N,
     )
