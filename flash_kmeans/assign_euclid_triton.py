@@ -143,6 +143,96 @@ def _euclid_assign_kernel(
     out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
     tl.store(out_ptrs, best_idx, mask=n_mask)
 
+@triton.autotune(_TUNE_CONFIGS, key=["N", "K"])
+@triton.jit
+def _cosine_assign_kernel(
+    x_ptr,                 # *f16 / *f32 [B, N, D]
+    c_ptr,                 # *f16 / *f32 [B, K, D]
+    out_ptr,               # *i32         [B, N]
+    B: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    stride_x_b: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_k: tl.constexpr,
+    stride_c_d: tl.constexpr,
+    stride_out_b: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Each program handles a tile of BLOCK_N points for a given batch element.
+
+    The kernel iterates over the centroid dimension K in chunks of BLOCK_K and
+    maintains the running minimum distance as well as the corresponding index
+    for every point in the tile.
+    """
+    pid_n = tl.program_id(0)          # tile index along N dimension
+    pid_b = tl.program_id(1)          # batch index
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offsets < N
+
+    # ------------------------------------------------------------------
+    # Load x tile  (BLOCK_N, D)
+    # ------------------------------------------------------------------
+    offs_d = tl.arange(0, D)
+    # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
+    x_ptrs = (
+        x_ptr
+        + pid_b * stride_x_b
+        + n_offsets[:, None] * stride_x_n
+        + offs_d[None, :] * stride_x_d
+    )
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
+    x_tile = x_tile  # compute in f32
+
+    # Init best distance / index
+    best_dist = tl.full((BLOCK_N,), -1, tl.float32)  # less is worse (cosine >= 0, so -1 must be updated)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    # ------------------------------------------------------------------
+    # Iterate over centroids in chunks of BLOCK_K
+    # ------------------------------------------------------------------
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < K
+
+        # Load centroid tile  (D, BLOCK_K)
+        c_ptrs = (
+            c_ptr
+            + pid_b * stride_c_b
+            + k_offsets[None, :] * stride_c_k
+            + offs_d[:, None] * stride_c_d
+        )
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
+        c_tile = c_tile
+
+        # Compute cosine distance (BLOCK_N, BLOCK_K) = x_tile @ c_tile
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
+
+        # Mask out invalid centroid columns before reduction
+        dist = tl.where(k_mask[None, :], cross, 0.0)
+        dist = tl.maximum(dist, 0.0)
+        dist = tl.minimum(dist, 1.0) # cosine similarity in [0, 1]
+
+        curr_max = tl.max(dist, axis=1)
+        curr_idx = tl.argmax(dist, axis=1)
+
+        update = curr_max > best_dist
+        best_dist = tl.where(update, curr_max, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+
+    # ------------------------------------------------------------------
+    # Write results
+    # ------------------------------------------------------------------
+    out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
 
 # ---------------------------------------------------------------
 # Python wrapper
@@ -206,6 +296,58 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
     )
     return out
 
+
+def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Tensor = None,
+                         *, BLOCK_N: int = 128, BLOCK_K: int = 128) -> torch.Tensor:
+    """Return nearest(cosine similarity)-centroid indices using Triton kernel.
+
+    Args:
+        x         : (B, N, D) float16 / float32 (on CUDA)
+        centroids : (B, K, D) same dtype/device as x
+
+    Returns:
+        cluster_ids (B, N) int32 (callers can cast to int64 if desired)
+    """
+    assert x.is_cuda and centroids.is_cuda, "All tensors must be on CUDA"
+    # assert x.dtype in (torch.float16, torch.float32), "x must be fp16/fp32"
+    assert centroids.dtype == x.dtype, "centroids dtype mismatch"
+
+    B, N, D = x.shape
+    K = centroids.shape[1]
+    assert centroids.shape == (B, K, D), "centroids shape mismatch"
+
+    # x = x.contiguous()
+    # centroids = centroids.contiguous()
+    # x_sq = x_sq.contiguous()
+
+    if out is None:
+        out = torch.empty((B, N), device=x.device, dtype=torch.int32)
+
+    # Strides (in elements)
+    stride_x_b, stride_x_n, stride_x_d = x.stride()
+    stride_c_b, stride_c_k, stride_c_d = centroids.stride()
+    stride_out_b, stride_out_n = out.stride()
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+
+    _cosine_assign_kernel[grid](
+        x,
+        centroids,
+        out,
+        B,
+        N,
+        K,
+        D,
+        stride_x_b,
+        stride_x_n,
+        stride_x_d,
+        stride_c_b,
+        stride_c_k,
+        stride_c_d,
+        stride_out_b,
+        stride_out_n,
+    )
+    return out
 
 # ---------------------------------------------------------------
 # Quick correctness & performance check
