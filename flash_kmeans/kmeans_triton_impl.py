@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.cuda import nvtx
 from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton
-from flash_kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid
+from flash_kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid, triton_centroid_update_sorted_cosine
 from tqdm import trange
 
 # -------------------- Compiled single-iteration kernels --------------------
@@ -21,16 +21,17 @@ def _cosine_iter(x_norm, centroids):
     # cos_sim = torch.einsum('bnd,bkd->bnk', x_norm, centroids)
     # cluster_ids = cos_sim.argmax(dim=-1)
     cluster_ids = cosine_assign_triton(x_norm, centroids)
-    centroids_new = triton_centroid_update_cosine(x_norm, cluster_ids, centroids)
+    centroids_new = triton_centroid_update_sorted_cosine(x_norm, cluster_ids, centroids)
     # centroids_new = centroids_new.clone()
     shift = (centroids_new - centroids).norm(dim=-1).max()
     return centroids_new, shift, cluster_ids
 
 # 3. Dot-product
 def _dot_iter(x, centroids):
-    sim = torch.einsum('bnd,bkd->bnk', x, centroids)
-    cluster_ids = sim.argmax(dim=-1)
-    centroids_new = triton_centroid_update_cosine(x, cluster_ids, centroids)
+    # sim = torch.einsum('bnd,bkd->bnk', x, centroids)
+    # cluster_ids = sim.argmax(dim=-1)
+    cluster_ids = cosine_assign_triton(x, centroids)
+    centroids_new = triton_centroid_update_sorted_cosine(x, cluster_ids, centroids)
     # centroids_new = centroids_new.clone()
     shift = (centroids_new - centroids).norm(dim=-1).max()
     return centroids_new, shift, cluster_ids
