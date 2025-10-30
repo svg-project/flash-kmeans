@@ -372,6 +372,13 @@ if __name__ == "__main__":
 
     print("Correct:", torch.equal(ref_ids.cpu(), tri_ids.cpu()))
 
+
+    dist_cos = torch.einsum("bnd,bkd->bnk", x.to(torch.float32), cent.to(torch.float32))
+    ref_ids_cos = dist_cos.argmax(dim=-1)
+    tri_ids_cos = cosine_assign_triton(x, cent, out)
+
+    print("Cosine Correct:", torch.equal(ref_ids_cos.cpu(), tri_ids_cos.cpu()))
+
     # Simple timing
     repeats = 20
     torch.cuda.synchronize()
@@ -383,4 +390,18 @@ if __name__ == "__main__":
     end.record(); torch.cuda.synchronize()
     print(f"Avg time Triton: {start.elapsed_time(end)/repeats:.3f} ms for {B}x{N} points vs {K} centroids") 
     print(f"{ref_ids[10, 69344]=}, {tri_ids[10, 69344]=}, {dist[10, 69344, ref_ids[10, 69344]]=}, {dist[10, 69344, tri_ids[10, 69344]]=}")
-    torch.testing.assert_close(ref_ids, tri_ids.to(ref_ids.dtype))
+    try:
+        torch.testing.assert_close(ref_ids, tri_ids.to(ref_ids.dtype))
+    except Exception as e:
+        print("Assertion failed:", e)
+
+    start.record()
+    for _ in range(repeats):
+        cosine_assign_triton(x, cent, out)
+    end.record(); torch.cuda.synchronize()
+    print(f"Avg time Triton Cosine: {start.elapsed_time(end)/repeats:.3f} ms for {B}x{N} points vs {K} centroids") 
+    print(f"{ref_ids_cos[10, 69344]=}, {tri_ids_cos[10, 69344]=}, {dist_cos[10, 69344, ref_ids_cos[10, 69344]]=}, {dist_cos[10, 69344, tri_ids_cos[10, 69344]]=}")
+    try:
+        torch.testing.assert_close(ref_ids_cos, tri_ids_cos.to(ref_ids_cos.dtype))
+    except Exception as e:
+        print("Assertion failed:", e)

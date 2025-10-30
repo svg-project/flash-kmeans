@@ -1,6 +1,6 @@
 import torch
-from flash_kmeans import batch_kmeans_Euclid
-from flash_kmeans.centroid_update_triton import triton_centroid_update_euclid
+from flash_kmeans import batch_kmeans_Euclid, batch_kmeans_Cosine
+from flash_kmeans.centroid_update_triton import triton_centroid_update_euclid, triton_centroid_update_cosine
 import time
 import argparse
 
@@ -10,6 +10,13 @@ def _euclid_iter_torch(x, x_sq, centroids):
     dist_sq = (x_sq[:,:,None] + cent_sq[:,None,:] - 2.0 * cross).clamp_min_(0.0)
     cluster_ids = dist_sq.argmin(dim=-1)
     centroids_new = triton_centroid_update_euclid(x, cluster_ids, centroids)
+    shift = (centroids_new - centroids).norm(dim=-1).max()
+    return centroids_new, shift, cluster_ids
+
+def _cosine_iter_torch(x, centroids):
+    cos_sim = torch.einsum('bnd,bkd->bnk', x, centroids)
+    cluster_ids = cos_sim.argmax(dim=-1)
+    centroids_new = triton_centroid_update_cosine(x, cluster_ids, centroids)
     shift = (centroids_new - centroids).norm(dim=-1).max()
     return centroids_new, shift, cluster_ids
 
@@ -58,6 +65,48 @@ def batch_kmeans_Euclid_torch(x, n_clusters, max_iters=100, tol=0.0, init_centro
 
     return cluster_ids, centroids, it + 1
 
+def batch_kmeans_Cosine_torch(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+    """
+    Batched KMeans clustering in PyTorch using Cosine distance.
+
+    Args:
+        x: Tensor of shape (B, N, D), batch_size B, N points per batch, D dims.
+        n_clusters: Number of clusters.
+        max_iters: Max number of iterations.
+        tol: Relative tolerance for center movement.
+        verbose: Print loss for each iter.
+    Returns:
+        cluster_ids: (B, N) LongTensor, cluster assignment for each point.
+        centroids: (B, n_clusters, D) final cluster centers.
+    """
+    B, N, D = x.shape
+
+    if init_centroids is None:
+        # Randomly select initial centers from x
+        indices = torch.randint(0, N, (B, n_clusters), device=x.device)
+        centroids = torch.gather(
+            x,
+            dim=1,
+            index=indices[..., None].expand(-1, -1, D)
+        )  # (B, n_clusters, D)
+    else:
+        centroids = init_centroids
+
+    centroids = centroids.view(B, n_clusters, D)
+
+    for it in range(max_iters):
+        # ---- compiled single iteration ----
+        centroids_new, center_shift, cluster_ids = _cosine_iter_torch(x, centroids)
+
+        # Check for convergence
+        if verbose:
+            print(f"Iter {it}, center shift: {center_shift.item():.6f}")
+        if center_shift < tol:
+            break
+        centroids = centroids_new.clone()
+
+    return cluster_ids, centroids, it + 1
+
 
 # https://github.com/DeMoriarty/fast_pytorch_kmeans 
 try:
@@ -65,6 +114,15 @@ try:
     def batch_kmeans_Euclid_fast_torch(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
 
         kmeans = KMeans(n_clusters=n_clusters, mode='euclidean', verbose=0, tol=tol, max_iter=max_iters)
+        all_labels = []
+        for i in range(x.shape[0]):
+            labels = kmeans.fit_predict(x[i])
+            all_labels.append(labels)
+        labels = torch.stack(all_labels)
+        return labels, None, None
+
+    def batch_kmeans_Cosine_fast_torch(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+        kmeans = KMeans(n_clusters=n_clusters, mode='cosine', verbose=0, tol=tol, max_iter=max_iters)
         all_labels = []
         for i in range(x.shape[0]):
             labels = kmeans.fit_predict(x[i])
@@ -90,6 +148,13 @@ def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
     end = time.time()
     return (end - start) / 10 * 1000
 
+def benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=100, tol=0.0):
+    for kmeans_func in kmeans_func_list:
+        print("Benchmarking:", kmeans_func.__name__)
+        t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
+        print(f"Time for {b}x{n}x{d}x{k} with {max_iters} iterations: {t} ms")
+        print(f"For 1 iteration: {t / max_iters} ms")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark KMeans implementations")
     parser.add_argument("--batch-size", "-b", type=int, default=32, help="Batch size")
@@ -98,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-clusters", "-k", type=int, default=1000, help="Number of clusters")
     parser.add_argument("--max-iters", type=int, default=100, help="Maximum number of iterations")
     parser.add_argument("--tol", type=float, default=-1, help="Tolerance for center movement; negative disables early stopping")
+    parser.add_argument("--distance-mode", type=str, default="euclid", choices=["euclid", "cosine"], help="Distance metric to use")
     args = parser.parse_args()
 
     b = args.batch_size
@@ -107,22 +173,35 @@ if __name__ == "__main__":
     max_iters = args.max_iters
     tol = args.tol
 
-    if batch_kmeans_Euclid_fast_torch is not None:
-        print("fast_pytorch_kmeans")
-        fast_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_fast_torch, max_iters=max_iters, tol=tol)
-        print(f"fast_pytorch_kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {fast_time} ms")
-        print(f"fast_pytorch_kmeans for 1 iteration: {fast_time / max_iters} ms")
+    if args.distance_mode == "euclid":
+        kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid]
+        if batch_kmeans_Euclid_fast_torch is not None:
+            kmeans_func_list.insert(0, batch_kmeans_Euclid_fast_torch)
+    elif args.distance_mode == "cosine":
+        kmeans_func_list = [batch_kmeans_Cosine_torch, batch_kmeans_Cosine]
+        if batch_kmeans_Cosine_fast_torch is not None:
+            kmeans_func_list.insert(0, batch_kmeans_Cosine_fast_torch)
     else:
-        print("fast_pytorch_kmeans is not installed")
-        print("Skipping fast_pytorch_kmeans benchmark")
-    print()
-    print("batched torch kmeans")
-    torch_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_torch, max_iters=max_iters, tol=tol)
-    print(f"batched torch kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {torch_time} ms")
-    print(f"batched torch kmeans for 1 iteration: {torch_time / max_iters} ms")
-    print()
-    print("flash_kmeans")
-    flash_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid, max_iters=max_iters, tol=tol)
-    print(f"flash_kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {flash_time} ms")
-    print(f"flash_kmeans for 1 iteration: {flash_time / max_iters} ms")
-    print()
+        raise ValueError("Invalid distance mode")
+    
+    benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=max_iters, tol=tol)
+
+    # if batch_kmeans_Euclid_fast_torch is not None:
+    #     print("fast_pytorch_kmeans")
+    #     fast_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_fast_torch, max_iters=max_iters, tol=tol)
+    #     print(f"fast_pytorch_kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {fast_time} ms")
+    #     print(f"fast_pytorch_kmeans for 1 iteration: {fast_time / max_iters} ms")
+    # else:
+    #     print("fast_pytorch_kmeans is not installed")
+    #     print("Skipping fast_pytorch_kmeans benchmark")
+    # print()
+    # print("batched torch kmeans")
+    # torch_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_torch, max_iters=max_iters, tol=tol)
+    # print(f"batched torch kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {torch_time} ms")
+    # print(f"batched torch kmeans for 1 iteration: {torch_time / max_iters} ms")
+    # print()
+    # print("flash_kmeans")
+    # flash_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid, max_iters=max_iters, tol=tol)
+    # print(f"flash_kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {flash_time} ms")
+    # print(f"flash_kmeans for 1 iteration: {flash_time / max_iters} ms")
+    # print()
