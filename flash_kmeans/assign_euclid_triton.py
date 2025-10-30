@@ -192,7 +192,7 @@ def _cosine_assign_kernel(
     x_tile = x_tile  # compute in f32
 
     # Init best distance / index
-    best_dist = tl.full((BLOCK_N,), -1, tl.float32)  # less is worse (cosine >= 0, so -1 must be updated)
+    best_dist = tl.full((BLOCK_N,), -3.4e38, tl.float32)  # less is worse 
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
     # ------------------------------------------------------------------
@@ -217,8 +217,6 @@ def _cosine_assign_kernel(
 
         # Mask out invalid centroid columns before reduction
         dist = tl.where(k_mask[None, :], cross, 0.0)
-        dist = tl.maximum(dist, 0.0)
-        dist = tl.minimum(dist, 1.0) # cosine similarity in [0, 1]
 
         curr_max = tl.max(dist, axis=1)
         curr_idx = tl.argmax(dist, axis=1)
