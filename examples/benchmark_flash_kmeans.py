@@ -176,7 +176,11 @@ def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
 def benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=100, tol=0.0):
     for kmeans_func in kmeans_func_list:
         print("Benchmarking:", kmeans_func.__name__)
-        t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
+        try:
+            t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
+        except Exception as e:
+            print("  Error during benchmarking:", e)
+            continue
         print(f"Time for {b}x{n}x{d}x{k} with {max_iters} iterations: {t} ms")
         print(f"For 1 iteration: {t / max_iters} ms")
 
