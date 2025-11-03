@@ -22,10 +22,11 @@ def _ceil_div(a: int, b: int) -> int:
 # -----------------------------------------------------------------------------
 
 _TUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": BN, "BLOCK_K": BK}, num_stages=4, num_warps=wp)
+    triton.Config({"BLOCK_N": BN, "BLOCK_K": BK}, num_stages=num_stages, num_warps=wp)
     for BN in [32, 64, 128]
     for BK in [32, 64, 128]
     for wp in [4, 8]
+    for num_stages in [1, 2, 4]
 ]
 
 
