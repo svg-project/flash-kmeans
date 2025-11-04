@@ -134,6 +134,31 @@ except ImportError:
     batch_kmeans_Euclid_fast_torch = None
 
 
+# https://github.com/AnswerDotAI/fastkmeans
+try:
+    from fastkmeans import FastKMeans
+    def batch_kmeans_Euclid_fastkmeans(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+        """
+        Wrapper for fastkmeans to match the batch interface.
+        Note: fastkmeans only supports Euclidean distance and processes each batch item separately.
+        """
+        all_labels = []
+        for i in range(x.shape[0]):
+            # FastKMeans expects 2D input (N, D)
+            # Convert to numpy for FastKMeans API
+            # For Fairness, we may remove .cpu().numpy() and modify fastkmeans to support tensors input instead of numpy arrays.
+            data = x[i].cpu().numpy()
+            kmeans = FastKMeans(d=data.shape[1], k=n_clusters, niter=max_iters, tol=-1e8, verbose=verbose, gpu=True, max_points_per_centroid=None)
+            kmeans.train(data)
+            labels = kmeans.predict(data)
+            all_labels.append(labels)
+        labels = torch.stack(all_labels)
+        return labels, None, None
+except ImportError:
+    print("fastkmeans is not installed")
+    batch_kmeans_Euclid_fastkmeans = None
+
+
 def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
     x = torch.randn(b, n, d, device='cuda', dtype=torch.float16)
     # warmup
@@ -151,7 +176,11 @@ def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
 def benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=100, tol=0.0):
     for kmeans_func in kmeans_func_list:
         print("Benchmarking:", kmeans_func.__name__)
-        t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
+        try:
+            t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
+        except Exception as e:
+            print("  Error during benchmarking:", e)
+            continue
         print(f"Time for {b}x{n}x{d}x{k} with {max_iters} iterations: {t} ms")
         print(f"For 1 iteration: {t / max_iters} ms")
 
@@ -177,6 +206,8 @@ if __name__ == "__main__":
         kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid]
         if batch_kmeans_Euclid_fast_torch is not None:
             kmeans_func_list.insert(0, batch_kmeans_Euclid_fast_torch)
+        if batch_kmeans_Euclid_fastkmeans is not None:
+            kmeans_func_list.insert(0, batch_kmeans_Euclid_fastkmeans)
     elif args.distance_mode == "cosine":
         kmeans_func_list = [batch_kmeans_Cosine_torch, batch_kmeans_Cosine]
         if batch_kmeans_Cosine_fast_torch is not None:
@@ -186,22 +217,3 @@ if __name__ == "__main__":
     
     benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=max_iters, tol=tol)
 
-    # if batch_kmeans_Euclid_fast_torch is not None:
-    #     print("fast_pytorch_kmeans")
-    #     fast_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_fast_torch, max_iters=max_iters, tol=tol)
-    #     print(f"fast_pytorch_kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {fast_time} ms")
-    #     print(f"fast_pytorch_kmeans for 1 iteration: {fast_time / max_iters} ms")
-    # else:
-    #     print("fast_pytorch_kmeans is not installed")
-    #     print("Skipping fast_pytorch_kmeans benchmark")
-    # print()
-    # print("batched torch kmeans")
-    # torch_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid_torch, max_iters=max_iters, tol=tol)
-    # print(f"batched torch kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {torch_time} ms")
-    # print(f"batched torch kmeans for 1 iteration: {torch_time / max_iters} ms")
-    # print()
-    # print("flash_kmeans")
-    # flash_time = benchmark_kmeans(b, n, d, k, batch_kmeans_Euclid, max_iters=max_iters, tol=tol)
-    # print(f"flash_kmeans time for {b}x{n}x{d}x{k} with {max_iters} iterations: {flash_time} ms")
-    # print(f"flash_kmeans for 1 iteration: {flash_time / max_iters} ms")
-    # print()

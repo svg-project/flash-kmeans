@@ -1,0 +1,68 @@
+diff --git a/fastkmeans/kmeans.py b/fastkmeans/kmeans.py
+index 41e87cf..2c3bc60 100644
+--- a/fastkmeans/kmeans.py
++++ b/fastkmeans/kmeans.py
+@@ -250,7 +250,7 @@ class FastKMeans:
+         if nredo != 1:
+             raise ValueError("nredo must be 1, redos not currently supported")
+ 
+-    def train(self, data: np.ndarray):
++    def train(self, data: np.ndarray | torch.Tensor):
+         """
+         Trains (fits) the KMeans model on the given data and sets `self.centroids`. Designed to mimic faiss's `train()` method.
+ 
+@@ -263,7 +263,10 @@ class FastKMeans:
+         np.random.seed(self.seed)
+ 
+         # Move data to PyTorch CPU Tensor
+-        data_torch = torch.from_numpy(data)
++        if isinstance(data, np.ndarray):
++            data_torch = torch.from_numpy(data)
++        elif isinstance(data, torch.Tensor):
++            data_torch = data
+         data_norms_torch = (data_torch**2).sum(dim=1)
+ 
+         device = _get_device(self.device)
+@@ -294,7 +297,7 @@ class FastKMeans:
+         self.train(data)
+         return self
+ 
+-    def predict(self, data: np.ndarray) -> np.ndarray:
++    def predict(self, data: np.ndarray | torch.Tensor) -> torch.Tensor:
+         """
+         Assigns each data point to the nearest centroid for even more compatibility with scikit-learn's `predict()`, which is what cool libraries do.
+ 
+@@ -305,7 +308,10 @@ class FastKMeans:
+         if self.centroids is None:
+             raise RuntimeError("Must call train() or fit() before predict().")
+ 
+-        data_torch = torch.from_numpy(data)
++        if isinstance(data, np.ndarray):
++            data_torch = torch.from_numpy(data)
++        elif isinstance(data, torch.Tensor):
++            data_torch = data
+         data_norms_torch = (data_torch**2).sum(dim=1)
+ 
+         # We'll do a chunked assignment pass, similar to the main loop, but no centroid updates
+@@ -314,7 +320,7 @@ class FastKMeans:
+         centroid_norms = (centroids_torch**2).sum(dim=1)
+ 
+         n_samples = data_torch.shape[0]
+-        labels = torch.empty(n_samples, dtype=torch.long, device="cpu")
++        labels = torch.empty(n_samples, dtype=torch.long, device=self.device)
+ 
+         start_idx = 0
+         while start_idx < n_samples:
+@@ -353,10 +359,10 @@ class FastKMeans:
+                     best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
+                     c_start = c_end
+ 
+-            labels[start_idx:end_idx] = best_ids.to("cpu")
++            labels[start_idx:end_idx] = best_ids
+             start_idx = end_idx
+ 
+-        return labels.numpy()
++        return labels
+ 
+     def fit_predict(self, data: np.ndarray) -> np.ndarray:
+         """
