@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional
-
+from flash_kmeans.torch_fallback import euclid_assign_torch_native_chunked, batch_kmeans_Euclid_torch_native
 import torch
 
 try:
@@ -37,8 +37,16 @@ class FlashKMeans:
         Maximum iterations.
     tol : float, default=1e-8
         Convergence tolerance on centroid shift.
+    use_triton : bool, default=True
+        Whether to use triton implementation. If False, falls back to PyTorch implementation.
     seed : int, default=0
         Random seed for centroid initialization.
+    chunk_size_data : int, default=32768
+        Only used when fallback to PyTorch implementation.
+        Chunk size along the data dimension for assignment/update steps.
+    chunk_size_centroids : int, default=1024
+        Only used when fallback to PyTorch implementation.
+        Chunk size along the centroid dimension for assignment/update steps.
     verbose : bool, default=False
         Whether to print per-iteration info.
     dtype : torch.dtype, optional
@@ -54,7 +62,10 @@ class FlashKMeans:
         k: int,
         niter: int = 25,
         tol: float = 1e-8,
+        use_triton: bool = True,
         seed: int = 0,
+        chunk_size_data: int = 32768,
+        chunk_size_centroids: int = 1024,
         verbose: bool = False,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
@@ -63,9 +74,19 @@ class FlashKMeans:
         self.k = int(k)
         self.niter = int(niter)
         self.tol = float(tol)
+        self.use_triton = bool(use_triton)
         self.seed = int(seed)
+        self.chunk_size_data = int(chunk_size_data)
+        self.chunk_size_centroids = int(chunk_size_centroids)
         self.verbose = bool(verbose)
         self.dtype = dtype
+
+        if self.use_triton:
+            try:
+                _require_triton_cuda()
+            except RuntimeError as e:
+                Warning(f"Falling back to PyTorch implementation: {e}")
+                self.use_triton = False
 
         # default device
         if device is None:
@@ -73,10 +94,6 @@ class FlashKMeans:
         else:
             self.device = device
 
-        # # Model state
-        # # Centroids are stored on CPU in float32 to minimize GPU memory usage post-training.
-        # # Shape is always (B, K, D), where B=1 for unbatched training.
-        # self.centroids: Optional[torch.Tensor] = None
 
     def train(self, data: torch.Tensor):
         """
@@ -90,7 +107,6 @@ class FlashKMeans:
             - (batch_size, n_samples, n_features)
 
         """
-        _require_triton_cuda()
 
         if data.ndim == 2:
             N, D = data.shape
@@ -110,15 +126,28 @@ class FlashKMeans:
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
-        # Run batched Triton KMeans (Euclidean)
-        cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
-            x_b,
-            self.k,
-            max_iters=self.niter,
-            tol=self.tol,
-            init_centroids=None,
-            verbose=self.verbose,
-        )
+        if self.use_triton:
+            # Run batched Triton KMeans (Euclidean)
+            cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
+                x_b,
+                self.k,
+                max_iters=self.niter,
+                tol=self.tol,
+                init_centroids=None,
+                verbose=self.verbose,
+            )
+        else:
+            # Run batched PyTorch KMeans (Euclidean)
+            cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid_torch_native(
+                x_b,
+                self.k,
+                max_iters=self.niter,
+                tol=self.tol,
+                init_centroids=None,
+                verbose=self.verbose,
+                chunk_size_N=self.chunk_size_data,
+                chunk_size_K=self.chunk_size_centroids,
+            )
  
         self.centroids_b = centroids_b
         self.cluster_ids_b = cluster_ids_b
@@ -142,7 +171,6 @@ class FlashKMeans:
 
         If model was trained batched (batch_size>1), prediction must be provided with the same batch_size.
         """
-        _require_triton_cuda()
 
         if self.centroids_b is None or self._batch_size is None:
             raise RuntimeError("Model not trained. Call train() or fit() first.")
@@ -169,8 +197,19 @@ class FlashKMeans:
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
  
         x_sq = (x_b ** 2).sum(dim=-1)
-        # Call Triton assignment kernel
-        labels_b = euclid_assign_triton(x_b, self.centroids_b, x_sq)
+
+        if self.use_triton:
+            # Call Triton assignment kernel
+            labels_b = euclid_assign_triton(x_b, self.centroids_b, x_sq)
+        else:
+            # Call PyTorch assignment fallback
+            labels_b = euclid_assign_torch_native_chunked(
+                x_b,
+                self.centroids_b,
+                x_sq,
+                chunk_size_N=self.chunk_size_data,
+                chunk_size_K=self.chunk_size_centroids,
+            )
 
         if B is None:
             return labels_b.squeeze(0)  # (N,)
