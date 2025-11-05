@@ -31,12 +31,23 @@ x = torch.randn(32, 75600, 128, device="cuda", dtype=torch.float16)
 cluster_ids, centers, _ = batch_kmeans_Euclid(x, n_clusters=1000, tol=1e-4, verbose=True)
 ```
 
+We also provide a API interface similar to `faiss/sklearn`, see [API docs](https://github.com/svg-project/flash-kmeans/blob/main/flash_kmeans/interface.py) for details.
+
 ## Benchmark
 
-Our Triton implementation brings significant performance improvements. Compared with a standard PyTorch [baseline](https://github.com/DeMoriarty/fast_pytorch_kmeans), it achieves **up to 16× speed-up** on an NVIDIA H100 GPU (FP16, batch size 32, 16k points, 128-D, 1k clusters).
 
-![Benchmark result](assets/flash_kmeans_per_iter.png)
+We compare the performance of our Triton implementation with the following baselines:
+  - [fast_pytorch_kmeans](https://github.com/DeMoriarty/fast_pytorch_kmeans) a Pytorch implmentation of K-Means clustering.
+  - [fastkmeans(triton) / fastkmeans(torch)](https://github.com/AnswerDotAI/fastkmeans) another triton implementation of K-Means clustering. (and its Pytorch fallback)
+  - flash-kmeans(triton) / flash-kmeans(torch): our implementation in Triton and Pytorch fallback.
+  - batched torch kmeans: a naive batch implementation without considering OOM. 
 
+Tested on NVIDIA H200 GPU with FP16 precision, 128 demensional data, varying number of clusters (k), data points (n) and batch size (b). Our Triton implementation brings significant performance improvements. 
+
+![Benchmark result 1](assets/bench_k100.png)
+![Benchmark result 2](assets/bench_k128.png)
+
+Note: fastkmeans(triton) get error when k=100 or k=1000 in figure 1.
 
 ## Citation
 

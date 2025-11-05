@@ -1,6 +1,7 @@
 import torch
 from flash_kmeans import batch_kmeans_Euclid, batch_kmeans_Cosine
 from flash_kmeans.centroid_update_triton import triton_centroid_update_euclid, triton_centroid_update_cosine
+from flash_kmeans.torch_fallback import batch_kmeans_Euclid_torch_native
 import time
 import argparse
 
@@ -136,19 +137,31 @@ except ImportError:
 
 # https://github.com/AnswerDotAI/fastkmeans
 try:
-    from fastkmeans import FastKMeans
+    from fastkmeans_patch import FastKMeans  # Apply monkey patch to fastkmeans
     def batch_kmeans_Euclid_fastkmeans(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
         """
         Wrapper for fastkmeans to match the batch interface.
         Note: fastkmeans only supports Euclidean distance and processes each batch item separately.
+        With monkey patch, we can pass torch.Tensor directly without numpy conversion.
         """
         all_labels = []
         for i in range(x.shape[0]):
             # FastKMeans expects 2D input (N, D)
-            # Convert to numpy for FastKMeans API
-            # For Fairness, we may remove .cpu().numpy() and modify fastkmeans to support tensors input instead of numpy arrays.
-            data = x[i].cpu().numpy()
-            kmeans = FastKMeans(d=data.shape[1], k=n_clusters, niter=max_iters, tol=-1e8, verbose=verbose, gpu=True, max_points_per_centroid=None)
+            # Use monkey patched version to accept tensor directly
+            data = x[i]
+            kmeans = FastKMeans(d=data.shape[1], k=n_clusters, niter=max_iters, tol=tol, verbose=verbose, gpu=True, max_points_per_centroid=None)
+            kmeans.train(data)
+            labels = kmeans.predict(data)
+            all_labels.append(labels)
+        labels = torch.stack(all_labels)
+        return labels, None, None
+    def batch_kmeans_Euclid_fastkmeans_torch(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+        all_labels = []
+        for i in range(x.shape[0]):
+            # FastKMeans expects 2D input (N, D)
+            # Use monkey patched version to accept tensor directly
+            data = x[i]
+            kmeans = FastKMeans(d=data.shape[1], k=n_clusters, niter=max_iters, tol=tol, verbose=verbose, gpu=True, max_points_per_centroid=None, use_triton=False)
             kmeans.train(data)
             labels = kmeans.predict(data)
             all_labels.append(labels)
@@ -173,16 +186,22 @@ def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
     end = time.time()
     return (end - start) / 10 * 1000
 
-def benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=100, tol=0.0):
-    for kmeans_func in kmeans_func_list:
-        print("Benchmarking:", kmeans_func.__name__)
-        try:
-            t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
-        except Exception as e:
-            print("  Error during benchmarking:", e)
-            continue
-        print(f"Time for {b}x{n}x{d}x{k} with {max_iters} iterations: {t} ms")
-        print(f"For 1 iteration: {t / max_iters} ms")
+def benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=100, tol=0.0, output_file="results.jsonl"):
+    with open(output_file, "a") as output:
+        for kmeans_func in kmeans_func_list:
+            print("Benchmarking:", kmeans_func.__name__)
+            try:
+                t = benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=max_iters, tol=tol)
+                print(f"Time for {b}x{n}x{d}x{k} with {max_iters} iterations: {t:.2f} ms")
+                print(f"For 1 iteration: {t / max_iters:.2f} ms")
+                # write to output json
+            except Exception as e:
+                t = -1
+                print(f"Error during benchmarking: {e}")
+            finally:
+                output.write(f'{{"method": "{kmeans_func.__name__}", "batch_size": {b}, "num_points": {n}, "dim": {d}, "num_clusters": {k}, "max_iters": {max_iters}, "tol": {tol}, "time_ms": {t}, "time_per_iter_ms": {t / max_iters}}}\n')
+                output.flush()
+            print()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark KMeans implementations")
@@ -193,6 +212,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-iters", type=int, default=100, help="Maximum number of iterations")
     parser.add_argument("--tol", type=float, default=-1, help="Tolerance for center movement; negative disables early stopping")
     parser.add_argument("--distance-mode", type=str, default="euclid", choices=["euclid", "cosine"], help="Distance metric to use")
+    parser.add_argument("--output-file", type=str, default="results.jsonl", help="Output file for benchmark results")
+    
     args = parser.parse_args()
 
     b = args.batch_size
@@ -203,17 +224,18 @@ if __name__ == "__main__":
     tol = args.tol
 
     if args.distance_mode == "euclid":
-        kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid]
+        kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid_torch_native, batch_kmeans_Euclid]
         if batch_kmeans_Euclid_fast_torch is not None:
             kmeans_func_list.insert(0, batch_kmeans_Euclid_fast_torch)
         if batch_kmeans_Euclid_fastkmeans is not None:
-            kmeans_func_list.insert(0, batch_kmeans_Euclid_fastkmeans)
+            kmeans_func_list.append(batch_kmeans_Euclid_fastkmeans_torch)
+            kmeans_func_list.append(batch_kmeans_Euclid_fastkmeans)
     elif args.distance_mode == "cosine":
         kmeans_func_list = [batch_kmeans_Cosine_torch, batch_kmeans_Cosine]
         if batch_kmeans_Cosine_fast_torch is not None:
             kmeans_func_list.insert(0, batch_kmeans_Cosine_fast_torch)
     else:
         raise ValueError("Invalid distance mode")
-    
-    benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=max_iters, tol=tol)
+
+    benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=max_iters, tol=tol, output_file=args.output_file)
 
