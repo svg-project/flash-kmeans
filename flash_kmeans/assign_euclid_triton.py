@@ -48,6 +48,7 @@ def _euclid_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
     c_ptr,                 # *f16 / *f32 [B, K, D]
     x_sq_ptr,              # *f32         [B, N]
+    c_sq_ptr,              # *f32         [B, K]
     out_ptr,               # *i32         [B, N]
     B: tl.constexpr,
     N: tl.constexpr,
@@ -61,6 +62,8 @@ def _euclid_assign_kernel(
     stride_c_d: tl.constexpr,
     stride_xsq_b: tl.constexpr,
     stride_xsq_n: tl.constexpr,
+    stride_csq_b: tl.constexpr,
+    stride_csq_k: tl.constexpr,
     stride_out_b: tl.constexpr,
     stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -118,8 +121,12 @@ def _euclid_assign_kernel(
         c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
         c_tile = c_tile
 
-        # Compute centroid squared norms (BLOCK_K,)
-        cent_sq = tl.sum(c_tile * c_tile, axis=0).to(tl.float32)
+        # load c_sq for the tile  (BLOCK_K,)
+        csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
+        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+        # # Compute centroid squared norms (BLOCK_K,)
+        # cent_sq = tl.sum(c_tile * c_tile, axis=0).to(tl.float32)
 
         # Compute cross term (BLOCK_N, BLOCK_K) = x_tile @ c_tile
         cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
@@ -237,7 +244,7 @@ def _cosine_assign_kernel(
 # Python wrapper
 # ---------------------------------------------------------------
 
-def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.Tensor, out: torch.Tensor = None,
+def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.Tensor, out: torch.Tensor = None, c_sq: torch.Tensor = None,
                          *, BLOCK_N: int = 128, BLOCK_K: int = 128) -> torch.Tensor:
     """Return nearest-centroid indices using Triton kernel.
 
@@ -245,6 +252,8 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
         x         : (B, N, D) float16 / float32 (on CUDA)
         centroids : (B, K, D) same dtype/device as x
         x_sq      : (B, N)    float32 – ||x||^2 per point (on CUDA)
+        out       : (B, N)    int32   – (option) pre-allocated output tensor (on CUDA)
+        c_sq      : (B, K)    float32 – (option) ||centroids||^2 per centroid (on CUDA)
 
     Returns:
         cluster_ids (B, N) int32 (callers can cast to int64 if desired)
@@ -264,11 +273,14 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
 
     if out is None:
         out = torch.empty((B, N), device=x.device, dtype=torch.int32)
+    if c_sq is None:
+        c_sq = (centroids.to(torch.float32) ** 2).sum(-1)
 
     # Strides (in elements)
     stride_x_b, stride_x_n, stride_x_d = x.stride()
     stride_c_b, stride_c_k, stride_c_d = centroids.stride()
     stride_xsq_b, stride_xsq_n = x_sq.stride()
+    stride_csq_b, stride_csq_k = c_sq.stride()
     stride_out_b, stride_out_n = out.stride()
 
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
@@ -277,6 +289,7 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
         x,
         centroids,
         x_sq,
+        c_sq,
         out,
         B,
         N,
@@ -290,6 +303,8 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
         stride_c_d,
         stride_xsq_b,
         stride_xsq_n,
+        stride_csq_b,
+        stride_csq_k,
         stride_out_b,
         stride_out_n,
     )
