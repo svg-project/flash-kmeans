@@ -56,7 +56,6 @@ def kmeans_largeN(
             centroids = init_centroids.to(device, non_blocking=True)
         else:
             indices = torch.randint(0, N, (K,), device="cpu", dtype=torch.int32)
-            print(indices)
             centroids = x[indices].to(device, non_blocking=True)
         cluster_ids = torch.empty((N,), device=device, dtype=torch.int32)
 
@@ -224,10 +223,12 @@ if __name__ == "__main__":
         tol=-1,
         verbose=True,
         # BLOCK_N=65536,
-        init_centroids=cent,
+        # init_centroids=cent,
     )
 
     # test
+    torch.cuda.synchronize()
+    start_time = time.time()
     start.record()
     cluster_ids_v3, centroids_v3 = kmeans_largeN(
         x,
@@ -236,12 +237,14 @@ if __name__ == "__main__":
         tol=-1,
         verbose=True,
         # BLOCK_N=65536,
-        init_centroids=cent,
+        # init_centroids=cent,
     )
     end.record()
     torch.cuda.synchronize()
+    end_time = time.time()
     esptime = start.elapsed_time(end)
     print(f"Time taken: {esptime:.2f}ms  {esptime/10:2f} ms/pre")
+    print(f"Time taken: {(end_time-start_time)*1e3:.2f}ms  {(end_time-start_time)*1e3/10:2f} ms/pre")
 
 
     # # warm up
