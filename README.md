@@ -49,6 +49,15 @@ Tested on NVIDIA H200 GPU with FP16 precision, 128 demensional data, varying num
 
 Note: fastkmeans(triton) get error when k=100 or k=1000 in figure 1.
 
+### Large tensor Benchmark
+
+For large input that cannot fit in GPU memory, we compare the performance with fastkmeans(triton) with FP32 precision, 128 demensional data, number if data points scaling from 256K to 268M  (N = 2^18, 2^20, 2^22, 2^24, 2^26, 2^28) with cluster counts following K = √N (512, 1024, 2048, 4096, 8192, 16384).
+
+Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and fastkmeans transfer data from CPU to GPU in chunk and compute.
+
+![benchmark large N](assets/benchmark_large.png)
+
+
 ## Citation
 
 If you use this codebase, or otherwise found our work valuable, please cite:

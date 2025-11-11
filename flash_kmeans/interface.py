@@ -8,6 +8,7 @@ import torch
 try:
     from flash_kmeans.kmeans_triton_impl import batch_kmeans_Euclid 
     from flash_kmeans.assign_euclid_triton import euclid_assign_triton
+    from flash_kmeans.kmeans_large import kmeans_largeN, kmeans_largeN_assign
     _HAS_TRITON_IMPL = True
 except Exception:
     _HAS_TRITON_IMPL = False
@@ -47,6 +48,9 @@ class FlashKMeans:
     chunk_size_centroids : int, default=1024
         Only used when fallback to PyTorch implementation.
         Chunk size along the centroid dimension for assignment/update steps.
+    chunk_size_data_cpu : int, default=1048576
+        Only when n_samples is too large to fit into GPU memory, this parameter controls
+        the chunk size of n_samples when copying data from CPU to GPU in chunks.
     verbose : bool, default=False
         Whether to print per-iteration info.
     dtype : torch.dtype, optional
@@ -66,6 +70,7 @@ class FlashKMeans:
         seed: int = 0,
         chunk_size_data: int = 32768,
         chunk_size_centroids: int = 1024,
+        chunk_size_data_cpu: int = 1048576,
         verbose: bool = False,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
@@ -78,6 +83,7 @@ class FlashKMeans:
         self.seed = int(seed)
         self.chunk_size_data = int(chunk_size_data)
         self.chunk_size_centroids = int(chunk_size_centroids)
+        self.chunk_size_data_cpu = int(chunk_size_data_cpu)
         self.verbose = bool(verbose)
         self.dtype = dtype
 
@@ -106,6 +112,9 @@ class FlashKMeans:
             - (n_samples, n_features)
             - (batch_size, n_samples, n_features)
 
+            if data is from GPU, it will process directly on GPU.
+            if data is from CPU, it will copy & process data on GPU by chunk_size_data_cpu.
+
         """
 
         if data.ndim == 2:
@@ -118,36 +127,52 @@ class FlashKMeans:
         else:
             raise ValueError("data must be of shape (n_samples, n_features) or (batch_size, n_samples, n_features)")
 
-        # Ensure CUDA + dtype
-        compute_dtype = self.dtype or x_b.dtype 
-        x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
-
         # Set random seed
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
-        if self.use_triton:
-            # Run batched Triton KMeans (Euclidean)
-            cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
-                x_b,
+        if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
+            # handle for large N on CPU
+            assert B is None, "Batched data with large N on CPU is not supported yet."
+            assert self.use_triton, "process large N data requires triton implementation." 
+            cluster_ids_b, centroids_b  = kmeans_largeN(
+                x_b[0],
                 self.k,
                 max_iters=self.niter,
                 tol=self.tol,
-                init_centroids=None,
                 verbose=self.verbose,
+                dtype=self.dtype,
+                BLOCK_N=self.chunk_size_data_cpu,
             )
+            centroids_b.unsqueeze_(0)
+            cluster_ids_b.unsqueeze_(0)
         else:
-            # Run batched PyTorch KMeans (Euclidean)
-            cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid_torch_native(
-                x_b,
-                self.k,
-                max_iters=self.niter,
-                tol=self.tol,
-                init_centroids=None,
-                verbose=self.verbose,
-                chunk_size_N=self.chunk_size_data,
-                chunk_size_K=self.chunk_size_centroids,
-            )
+            # Ensure CUDA + dtype
+            compute_dtype = self.dtype or x_b.dtype
+            x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
+
+            if self.use_triton:
+                # Run batched Triton KMeans (Euclidean)
+                cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
+                    x_b,
+                    self.k,
+                    max_iters=self.niter,
+                    tol=self.tol,
+                    init_centroids=None,
+                    verbose=self.verbose,
+                )
+            else:
+                # Run batched PyTorch KMeans (Euclidean)
+                cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid_torch_native(
+                    x_b,
+                    self.k,
+                    max_iters=self.niter,
+                    tol=self.tol,
+                    init_centroids=None,
+                    verbose=self.verbose,
+                    chunk_size_N=self.chunk_size_data,
+                    chunk_size_K=self.chunk_size_centroids,
+                )
  
         self.centroids_b = centroids_b
         self.cluster_ids_b = cluster_ids_b
@@ -172,7 +197,7 @@ class FlashKMeans:
         If model was trained batched (batch_size>1), prediction must be provided with the same batch_size.
         """
 
-        if self.centroids_b is None or self._batch_size is None:
+        if self.centroids_b is None:
             raise RuntimeError("Model not trained. Call train() or fit() first.")
 
         # Normalize input shape
@@ -191,7 +216,19 @@ class FlashKMeans:
                 f"Model was trained with batch size B={self._batch_size}, "
                 f"but predict received B={B}. Provide matching batch size."
             )
-
+        
+        if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
+            # handle for large N on CPU
+            assert B is None, "Batched data with large N on CPU is not supported yet."
+            assert self.use_triton, "process large N data requires triton implementation." 
+            labels = kmeans_largeN_assign(
+                x_b[0],
+                self.centroids_b[0],
+                dtype=self.dtype,
+                BLOCK_N=self.chunk_size_data_cpu,
+            )
+            return labels  # (N,)
+    
         # Prepare tensors for kernel call
         compute_dtype = self.dtype or x_b.dtype 
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
