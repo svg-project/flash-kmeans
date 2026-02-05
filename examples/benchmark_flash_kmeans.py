@@ -109,6 +109,23 @@ def batch_kmeans_Cosine_torch(x, n_clusters, max_iters=100, tol=0.0, init_centro
     return cluster_ids, centroids, it + 1
 
 
+def _make_flash_euclid(use_heuristic: bool):
+    def _fn(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+        return batch_kmeans_Euclid(
+            x,
+            n_clusters,
+            max_iters=max_iters,
+            tol=tol,
+            init_centroids=init_centroids,
+            verbose=verbose,
+            use_heuristic=use_heuristic,
+        )
+
+    suffix = "heuristic" if use_heuristic else "autotune"
+    _fn.__name__ = f"batch_kmeans_Euclid_{suffix}"
+    return _fn
+
+
 # https://github.com/DeMoriarty/fast_pytorch_kmeans 
 try:
     from fast_pytorch_kmeans import KMeans
@@ -213,6 +230,7 @@ if __name__ == "__main__":
     parser.add_argument("--tol", type=float, default=-1, help="Tolerance for center movement; negative disables early stopping")
     parser.add_argument("--distance-mode", type=str, default="euclid", choices=["euclid", "cosine"], help="Distance metric to use")
     parser.add_argument("--output-file", type=str, default="results.jsonl", help="Output file for benchmark results")
+    parser.add_argument("--enable-heuristic", dest="use_heuristic", action="store_true", help="Use heuristic Triton config for flash-kmeans (Euclid only)")
     
     args = parser.parse_args()
 
@@ -224,7 +242,8 @@ if __name__ == "__main__":
     tol = args.tol
 
     if args.distance_mode == "euclid":
-        kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid_torch_native, batch_kmeans_Euclid]
+        flash_euclid = _make_flash_euclid(args.use_heuristic)
+        kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid_torch_native, flash_euclid]
         if batch_kmeans_Euclid_fast_torch is not None:
             kmeans_func_list.insert(0, batch_kmeans_Euclid_fast_torch)
         if batch_kmeans_Euclid_fastkmeans is not None:

@@ -8,9 +8,9 @@ from tqdm import trange
 # -------------------- Compiled single-iteration kernels --------------------
 
 # 1. Euclidean
-def _euclid_iter(x, x_sq, centroids):
+def _euclid_iter(x, x_sq, centroids, use_heuristic=True):
     
-    cluster_ids = euclid_assign_triton(x, centroids, x_sq)
+    cluster_ids = euclid_assign_triton(x, centroids, x_sq, use_heuristic=use_heuristic)
     centroids_new = triton_centroid_update_sorted_euclid(x, cluster_ids, centroids)
 
     shift = (centroids_new - centroids).norm(dim=-1).max()
@@ -52,7 +52,16 @@ except Exception:  # pragma: no cover
     _cosine_iter_compiled = _cosine_iter
     _dot_iter_compiled    = _dot_iter
 
-def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+def batch_kmeans_Euclid(
+    x,
+    n_clusters,
+    max_iters=100,
+    tol=0.0,
+    init_centroids=None,
+    verbose=False,
+    *,
+    use_heuristic=True,
+):
     """
     Batched KMeans clustering in PyTorch using Euclidean distance.
 
@@ -62,6 +71,7 @@ def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
         max_iters: Max number of iterations.
         tol: Relative tolerance for center movement.
         verbose: Print loss for each iter.
+        use_heuristic: Use heuristic Triton config (skip autotune).
     Returns:
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
@@ -86,7 +96,9 @@ def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
 
     for it in range(max_iters):
         # ---- compiled single iteration ----
-        centroids_new, center_shift, cluster_ids = _euclid_iter_compiled(x, x_sq, centroids)
+        centroids_new, center_shift, cluster_ids = _euclid_iter_compiled(
+            x, x_sq, centroids, use_heuristic
+        )
 
         # 4. Check for convergence
         if verbose:

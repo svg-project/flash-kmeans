@@ -1,3 +1,4 @@
+from typing import Optional
 import torch
 import triton
 import triton.language as tl
@@ -41,8 +42,54 @@ def _cfg_keep(conf):
 
 _TUNE_CONFIGS = list(filter(_cfg_keep, _TUNE_CONFIGS))
 
+def _heuristic_euclid_config(N: int, K: int, D: int):
+    """Heuristic config selection without autotune."""
+    # Start with dimension-driven choices to control register pressure.
+    if D >= 512:
+        block_n = 64
+        block_k = 64
+        num_warps = 8
+        num_stages = 2
+    elif D >= 256:
+        block_n = 128
+        block_k = 64
+        num_warps = 8
+        num_stages = 2
+    else:
+        if K >= 16384:
+            block_n = 128
+            block_k = 128
+            num_warps = 8
+            num_stages = 2
+        elif K >= 4096:
+            block_n = 128
+            block_k = 64
+            num_warps = 8
+            num_stages = 2
+        else:
+            block_n = 64
+            block_k = 64
+            num_warps = 4
+            num_stages = 2
 
-@triton.autotune(_TUNE_CONFIGS, key=["N", "K"])
+    # Smaller N favors smaller BLOCK_N to reduce wasted work.
+    if N < 65536:
+        block_n = 64
+
+    # Extremely large K: use smaller BLOCK_K to reduce pressure.
+    if K >= 131072:
+        block_k = 64
+        num_warps = 8
+        num_stages = 2
+
+    return {
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
 @triton.jit
 def _euclid_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
@@ -151,7 +198,8 @@ def _euclid_assign_kernel(
     out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
     tl.store(out_ptrs, best_idx, mask=n_mask)
 
-@triton.autotune(_TUNE_CONFIGS, key=["N", "K"])
+_euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_euclid_assign_kernel)
+
 @triton.jit
 def _cosine_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
@@ -239,13 +287,27 @@ def _cosine_assign_kernel(
     out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
     tl.store(out_ptrs, best_idx, mask=n_mask)
 
+_cosine_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_cosine_assign_kernel)
+
 
 # ---------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------
 
-def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.Tensor, out: torch.Tensor = None, c_sq: torch.Tensor = None,
-                         *, BLOCK_N: int = 128, BLOCK_K: int = 128) -> torch.Tensor:
+def euclid_assign_triton(
+    x: torch.Tensor,
+    centroids: torch.Tensor,
+    x_sq: torch.Tensor,
+    out: torch.Tensor = None,
+    c_sq: torch.Tensor = None,
+    *,
+    BLOCK_N: int = 128,
+    BLOCK_K: int = 128,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
+    config: Optional[dict] = None,
+    use_heuristic: bool = True,
+) -> torch.Tensor:
     """Return nearest-centroid indices using Triton kernel.
 
     Args:
@@ -257,6 +319,9 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
 
     Returns:
         cluster_ids (B, N) int32 (callers can cast to int64 if desired)
+    Extra:
+        config        : {"BLOCK_N","BLOCK_K","num_warps","num_stages"} to force a config
+        use_heuristic : use a fixed heuristic config instead of autotune
     """
     assert x.is_cuda and centroids.is_cuda and x_sq.is_cuda, "All tensors must be on CUDA"
     # assert x.dtype in (torch.float16, torch.float32), "x must be fp16/fp32"
@@ -285,29 +350,73 @@ def euclid_assign_triton(x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.T
 
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
 
-    _euclid_assign_kernel[grid](
-        x,
-        centroids,
-        x_sq,
-        c_sq,
-        out,
-        B,
-        N,
-        K,
-        D,
-        stride_x_b,
-        stride_x_n,
-        stride_x_d,
-        stride_c_b,
-        stride_c_k,
-        stride_c_d,
-        stride_xsq_b,
-        stride_xsq_n,
-        stride_csq_b,
-        stride_csq_k,
-        stride_out_b,
-        stride_out_n,
-    )
+    selected_config = None
+    if config is not None:
+        selected_config = config
+    elif num_warps is not None or num_stages is not None:
+        if num_warps is None or num_stages is None:
+            raise ValueError("num_warps and num_stages must be set together")
+        selected_config = {
+            "BLOCK_N": BLOCK_N,
+            "BLOCK_K": BLOCK_K,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    elif use_heuristic:
+        selected_config = _heuristic_euclid_config(N, K, D)
+
+    if selected_config is not None:
+        _euclid_assign_kernel[grid](
+            x,
+            centroids,
+            x_sq,
+            c_sq,
+            out,
+            B,
+            N,
+            K,
+            D,
+            stride_x_b,
+            stride_x_n,
+            stride_x_d,
+            stride_c_b,
+            stride_c_k,
+            stride_c_d,
+            stride_xsq_b,
+            stride_xsq_n,
+            stride_csq_b,
+            stride_csq_k,
+            stride_out_b,
+            stride_out_n,
+            BLOCK_N=selected_config["BLOCK_N"],
+            BLOCK_K=selected_config["BLOCK_K"],
+            num_warps=selected_config["num_warps"],
+            num_stages=selected_config["num_stages"],
+        )
+    else:
+        _euclid_assign_kernel_autotuned[grid](
+            x,
+            centroids,
+            x_sq,
+            c_sq,
+            out,
+            B,
+            N,
+            K,
+            D,
+            stride_x_b,
+            stride_x_n,
+            stride_x_d,
+            stride_c_b,
+            stride_c_k,
+            stride_c_d,
+            stride_xsq_b,
+            stride_xsq_n,
+            stride_csq_b,
+            stride_csq_k,
+            stride_out_b,
+            stride_out_n,
+        )
     return out
 
 
@@ -344,7 +453,7 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
 
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
 
-    _cosine_assign_kernel[grid](
+    _cosine_assign_kernel_autotuned[grid](
         x,
         centroids,
         out,
