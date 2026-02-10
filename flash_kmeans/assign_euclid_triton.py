@@ -43,44 +43,50 @@ def _cfg_keep(conf):
 _TUNE_CONFIGS = list(filter(_cfg_keep, _TUNE_CONFIGS))
 
 def _heuristic_euclid_config(N: int, K: int, D: int):
-    """Heuristic config selection without autotune."""
-    # Start with dimension-driven choices to control register pressure.
+    """Heuristic config selection without autotune.
+
+    Priority: D (resource pressure) -> K (loop count) -> N (tail waste).
+    """
+    block_n = 128
+    block_k = 64
+    num_warps = 4
+    num_stages = 1
+
     if D >= 512:
-        block_n = 64
-        block_k = 64
-        num_warps = 8
-        num_stages = 2
-    elif D >= 256:
         block_n = 128
         block_k = 64
         num_warps = 8
+        num_stages = 1
+    elif D >= 256:
+        block_n = 128
+        block_k = 64
+        num_warps = 4
         num_stages = 2
     else:
-        if K >= 16384:
-            block_n = 128
+        # D <= 128
+        if K >= 4096:
             block_k = 128
-            num_warps = 8
-            num_stages = 2
-        elif K >= 4096:
-            block_n = 128
-            block_k = 64
-            num_warps = 8
-            num_stages = 2
+            if D >= 128:
+                num_warps = 8
+                num_stages = 2
+            else:
+                num_warps = 4
+                num_stages = 4
         else:
-            block_n = 64
             block_k = 64
             num_warps = 4
-            num_stages = 2
+            num_stages = 1
+
+    # D=64 with large K tends to prefer smaller BLOCK_N and deeper pipeline.
+    if D <= 64 and K >= 4096:
+        block_n = 64
+        block_k = 128
+        num_warps = 4
+        num_stages = 4
 
     # Smaller N favors smaller BLOCK_N to reduce wasted work.
     if N < 65536:
         block_n = 64
-
-    # Extremely large K: use smaller BLOCK_K to reduce pressure.
-    if K >= 131072:
-        block_k = 64
-        num_warps = 8
-        num_stages = 2
 
     return {
         "BLOCK_N": block_n,
