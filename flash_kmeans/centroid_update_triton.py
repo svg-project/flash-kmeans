@@ -30,8 +30,8 @@ def _centroid_update_kernel(
     token_idx = pid  # range: [0, B*N)
 
     # Derive (b, n)
-    b = token_idx // N
-    n = token_idx % N
+    b = (token_idx // N).to(tl.int64)
+    n = (token_idx % N).to(tl.int64)
 
     # pointer to this token's feature vector
     x_offset = b * stride_x_b + n * stride_x_n
@@ -39,11 +39,12 @@ def _centroid_update_kernel(
 
     cluster_idx = tl.load(cluster_ptr + b * N + n)
     cluster_idx = tl.where(cluster_idx < K, cluster_idx, 0)
+    cluster_idx = cluster_idx.to(tl.int64)
 
     # base ptr for centroid accum array
     centroid_base = b * stride_sum_b + cluster_idx * stride_sum_k
 
-    offs = tl.arange(0, BLOCK_D)
+    offs = tl.arange(0, BLOCK_D).to(tl.int64)
     for d_start in range(0, D, BLOCK_D):
         mask = offs + d_start < D
         feats = tl.load(x_tok_ptr + (d_start + offs) * stride_x_d, mask=mask, other=0.0)
@@ -197,8 +198,8 @@ def _centroid_update_chunk_kernel(
     pid_chunk = tl.program_id(axis=0)
     pid_b     = tl.program_id(axis=1)
 
-    b = pid_b
-    chunk_start = pid_chunk * BLOCK_N  # position of the first token handled by this program
+    b = pid_b.to(tl.int64)
+    chunk_start = (pid_chunk * BLOCK_N).to(tl.int64)  # position of the first token handled by this program
 
     # Nothing to do – out of range
     if chunk_start >= N:
@@ -210,8 +211,8 @@ def _centroid_update_chunk_kernel(
     x_batch_base       = x_ptr + b * stride_x_b  # for pointer arithmetic
 
     # helper aranges
-    offs_token = tl.arange(0, BLOCK_N)
-    offs_dim   = tl.arange(0, D)
+    offs_token = tl.arange(0, BLOCK_N).to(tl.int64)
+    offs_dim   = tl.arange(0, D).to(tl.int64)
 
     # first token index & validity mask
     token_idx  = chunk_start + offs_token
@@ -225,6 +226,7 @@ def _centroid_update_chunk_kernel(
     all_ids = tl.load(cid_batch_base + token_idx * stride_cluster_n, mask=valid_tok, other=-1)
 
     all_tokens_idxs = tl.load(idx_batch_base + token_idx * stride_idx_n, mask=valid_tok, other=-1) # [BLOCK_N]
+    all_tokens_idxs = all_tokens_idxs.to(tl.int64)
 
     load_mask = all_tokens_idxs[:,None] * D + offs_dim[None,:]
 

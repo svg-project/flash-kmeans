@@ -130,15 +130,17 @@ def _euclid_assign_kernel(
     """
     pid_n = tl.program_id(0)          # tile index along N dimension
     pid_b = tl.program_id(1)          # batch index
+    pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
     n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_offsets = n_offsets.to(tl.int64)
     n_mask = n_offsets < N
 
     # ------------------------------------------------------------------
     # Load x tile  (BLOCK_N, D)
     # ------------------------------------------------------------------
-    offs_d = tl.arange(0, D)
+    offs_d = tl.arange(0, D).to(tl.int64)
     # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
     x_ptrs = (
         x_ptr
@@ -162,6 +164,7 @@ def _euclid_assign_kernel(
     # ------------------------------------------------------------------
     for k_start in range(0, K, BLOCK_K):
         k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_offsets = k_offsets.to(tl.int64)
         k_mask = k_offsets < K
 
         # Load centroid tile  (D, BLOCK_K)
@@ -234,15 +237,17 @@ def _cosine_assign_kernel(
     """
     pid_n = tl.program_id(0)          # tile index along N dimension
     pid_b = tl.program_id(1)          # batch index
+    pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
     n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_offsets = n_offsets.to(tl.int64)
     n_mask = n_offsets < N
 
     # ------------------------------------------------------------------
     # Load x tile  (BLOCK_N, D)
     # ------------------------------------------------------------------
-    offs_d = tl.arange(0, D)
+    offs_d = tl.arange(0, D).to(tl.int64)
     # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
     x_ptrs = (
         x_ptr
@@ -262,6 +267,7 @@ def _cosine_assign_kernel(
     # ------------------------------------------------------------------
     for k_start in range(0, K, BLOCK_K):
         k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_offsets = k_offsets.to(tl.int64)
         k_mask = k_offsets < K
 
         # Load centroid tile  (D, BLOCK_K)
