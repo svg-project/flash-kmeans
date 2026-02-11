@@ -110,6 +110,74 @@ def _heuristic_euclid_config(
             "num_stages": num_stages,
         }
 
+    if "H100" in gpu_name:
+        # H100 tuned heuristic (more conservative on D=64 mid-K vs H200).
+        block_n = 128
+        block_k = 64
+        num_warps = 4
+        num_stages = 1
+
+        if D >= 512:
+            block_n = 128
+            block_k = 64
+            num_warps = 8
+            num_stages = 1
+        elif D >= 256:
+            block_n = 128
+            block_k = 64
+            if K <= 1024:
+                num_warps = 8
+                num_stages = 1
+            elif K <= 16384:
+                num_warps = 4
+                num_stages = 1
+            else:
+                num_warps = 8
+                num_stages = 1
+        else:
+            # D <= 128
+            if D <= 64:
+                if K <= 1024:
+                    block_k = 64
+                    num_warps = 4
+                    num_stages = 2
+                elif K <= 16384:
+                    block_k = 64
+                    num_warps = 4
+                    num_stages = 2
+                elif K <= 65536:
+                    block_k = 128
+                    num_warps = 4
+                    num_stages = 4
+                else:
+                    block_k = 64
+                    num_warps = 4
+                    num_stages = 4
+            else:
+                # D == 128
+                if K <= 1024:
+                    block_k = 64
+                    num_warps = 4
+                    num_stages = 1
+                elif K <= 65536:
+                    block_k = 128
+                    num_warps = 8
+                    num_stages = 2
+                else:
+                    block_k = 64
+                    num_warps = 4
+                    num_stages = 4
+
+        if N < 65536:
+            block_n = 64
+
+        return {
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
     if "A100" in gpu_name:
         # Robust default on A100 across tuned grid.
         block_n = 128
