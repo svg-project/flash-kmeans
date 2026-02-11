@@ -42,57 +42,107 @@ def _cfg_keep(conf):
 
 _TUNE_CONFIGS = list(filter(_cfg_keep, _TUNE_CONFIGS))
 
-def _heuristic_euclid_config(N: int, K: int, D: int):
-    """Heuristic config selection without autotune.
+def _heuristic_euclid_config(
+    N: int,
+    K: int,
+    D: int,
+    *,
+    device: Optional[torch.device] = None,
+):
+    """Architecture-aware heuristic config selection without autotune.
 
-    Priority: D (resource pressure) -> K (loop count) -> N (tail waste).
+    Keep one unified heuristic entry and diverge inside by GPU family:
+    - H200: existing hand-tuned heuristic
+    - A100: heuristic derived from A100 grid tuning results
+    - others: conservative fallback to reduce OOR risk
     """
-    block_n = 128
-    block_k = 64
-    num_warps = 4
-    num_stages = 1
+    if device is None:
+        device = torch.device("cuda")
+    gpu_name = torch.cuda.get_device_properties(device).name.upper()
 
-    if D >= 512:
-        block_n = 128
-        block_k = 64
-        num_warps = 8
-        num_stages = 1
-    elif D >= 256:
+    if "H200" in gpu_name:
+        # Keep the original H200 heuristic as-is.
         block_n = 128
         block_k = 64
         num_warps = 4
-        num_stages = 2
-    else:
-        # D <= 128
-        if K >= 4096:
-            block_k = 128
-            if D >= 128:
-                num_warps = 8
-                num_stages = 2
-            else:
-                num_warps = 4
-                num_stages = 4
-        else:
+        num_stages = 1
+
+        if D >= 512:
+            block_n = 128
+            block_k = 64
+            num_warps = 8
+            num_stages = 1
+        elif D >= 256:
+            block_n = 128
             block_k = 64
             num_warps = 4
-            num_stages = 1
+            num_stages = 2
+        else:
+            # D <= 128
+            if K >= 4096:
+                block_k = 128
+                if D >= 128:
+                    num_warps = 8
+                    num_stages = 2
+                else:
+                    num_warps = 4
+                    num_stages = 4
+            else:
+                block_k = 64
+                num_warps = 4
+                num_stages = 1
 
-    # D=64 with large K tends to prefer smaller BLOCK_N and deeper pipeline.
-    if D <= 64 and K >= 4096:
-        block_n = 64
-        block_k = 128
+        # D=64 with large K tends to prefer smaller BLOCK_N and deeper pipeline.
+        if D <= 64 and K >= 4096:
+            block_n = 64
+            block_k = 128
+            num_warps = 4
+            num_stages = 4
+
+        # Smaller N favors smaller BLOCK_N to reduce wasted work.
+        if N < 65536:
+            block_n = 64
+
+        return {
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
+    if "A100" in gpu_name:
+        # Robust default on A100 across tuned grid.
+        block_n = 128
+        block_k = 32
         num_warps = 4
-        num_stages = 4
+        num_stages = 2
 
-    # Smaller N favors smaller BLOCK_N to reduce wasted work.
-    if N < 65536:
-        block_n = 64
+        if D == 128:
+            # Small-N cases tend to prefer a larger K tile.
+            if N <= 65536:
+                block_k = 64
+        elif D == 256:
+            # D=256 benefits from deeper pipeline at larger K.
+            if K >= 65536:
+                block_k = 32
+                num_stages = 4
+            elif K >= 1024 and N <= 262144:
+                block_k = 64
+                num_stages = 4
 
+        return {
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
+    # Conservative fallback for unknown architectures (prioritize avoiding OOR).
     return {
-        "BLOCK_N": block_n,
-        "BLOCK_K": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 1,
     }
 
 
@@ -375,7 +425,7 @@ def euclid_assign_triton(
             "num_stages": num_stages,
         }
     elif use_heuristic:
-        selected_config = _heuristic_euclid_config(N, K, D)
+        selected_config = _heuristic_euclid_config(N, K, D, device=x.device)
 
     if selected_config is not None:
         _euclid_assign_kernel[grid](
