@@ -67,14 +67,11 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 If you use this codebase, or otherwise found our work valuable, please cite:
 
 ```
-@misc{yang2026flashkmeans,
-      title={Flash-KMeans: Fast and Memory-Efficient Exact K-Means}, 
-      author={Shuo Yang and Haocheng Xi and Yilong Zhao and Muyang Li and Xiaoze Fan and Jintao Zhang and Han Cai and Yujun Lin and Xiuyu Li and Kurt Keutzer and Song Han and Chenfeng Xu and Ion Stoica},
-      year={2026},
-      eprint={2603.09229},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2603.09229}, 
+@article{yang2026flash,
+  title={Flash-KMeans: Fast and Memory-Efficient Exact K-Means},
+  author={Yang, Shuo and Xi, Haocheng and Zhao, Yilong and Li, Muyang and Fan, Xiaoze and Zhang, Jintao and Cai, Han and Lin, Yujun and Li, Xiuyu and Keutzer, Kurt and others},
+  journal={arXiv preprint arXiv:2603.09229},
+  year={2026}
 }
 
 @article{yang2025sparse,
