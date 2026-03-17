@@ -62,6 +62,10 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 ![benchmark large N](assets/benchmark_large.png)
 
 
+## Community Ports
+
+- [flash-kmeans-mlx](https://github.com/hanxiao/flash-kmeans-mlx) - Pure MLX port for Apple Silicon (M-series GPU), up to 94x faster than sklearn.
+
 ## Citation
 
 If you use this codebase, or otherwise found our work valuable, please cite:
