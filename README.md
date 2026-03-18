@@ -81,3 +81,7 @@ If you use this codebase, or otherwise found our work valuable, please cite:
   year={2025}
 }
 ```
+
+## Community Ports
+
+- **[flash-kmeans-mlx](https://github.com/hanxiao/flash-kmeans-mlx)** - Apple Silicon port using MLX. Pure MLX, no PyTorch dependency. 500K points clustered in 77ms on M3 Ultra (517x faster than sklearn).
