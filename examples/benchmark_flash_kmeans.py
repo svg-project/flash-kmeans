@@ -243,8 +243,7 @@ if __name__ == "__main__":
 
     if args.distance_mode == "euclid":
         flash_euclid = _make_flash_euclid(args.use_heuristic)
-        # kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid_torch_native, flash_euclid]
-        kmeans_func_list = [flash_euclid]
+        kmeans_func_list = [batch_kmeans_Euclid_torch, batch_kmeans_Euclid_torch_native, flash_euclid]
         if batch_kmeans_Euclid_fast_torch is not None:
             kmeans_func_list.insert(0, batch_kmeans_Euclid_fast_torch)
         if batch_kmeans_Euclid_fastkmeans is not None:
