@@ -61,6 +61,24 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ![benchmark large N](assets/benchmark_large.png)
 
+### Multi-GPU Support
+
+For large-N workloads (`kmeans_largeN`), flash-kmeans now supports automatic multi-GPU scaling. When `device=None`, all available GPUs are used automatically; specifying a single device (e.g. `device="cuda:0"`) falls back to single-GPU mode. No new API parameters are needed.
+
+The multi-GPU pipeline extends the single-GPU double-buffered streaming design with:
+
+- **Data partitioning across GPUs**: The N data points are split into contiguous block partitions, one per GPU. Each GPU independently runs its own double-buffered H2D + compute pipeline over its partition, so PCIe bandwidth scales linearly with GPU count.
+- **Lightweight AllReduce via manual gather-reduce-broadcast**: After all GPUs finish their local accumulation, partial centroid sums (~4 MB) and counts (~32 KB) are gathered to GPU 0 via D2D copies (NVLink), reduced, and the new centroids are broadcast back. No NCCL dependency — the data is small enough that manual copies are faster and keep everything in a single process.
+- **H2D / D2D overlap**: H2D transfers use PCIe while the AllReduce uses NVLink — different hardware paths that can run concurrently. The first H2D block of the next iteration is prefetched during the current iteration's AllReduce, hiding the reduce latency behind the transfer.
+
+```python
+from flash_kmeans import FlashKMeans
+
+# Automatically uses all visible GPUs for large-N CPU data
+km = FlashKMeans(d=128, k=8192, niter=100)
+labels = km.fit_predict(large_cpu_tensor)  # device=None → multi-GPU
+```
+
 
 ## Citation
 

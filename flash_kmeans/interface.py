@@ -94,7 +94,9 @@ class FlashKMeans:
                 Warning(f"Falling back to PyTorch implementation: {e}")
                 self.use_triton = False
 
-        # default device
+        # Store raw device for largeN multi-GPU path (None = auto-detect all GPUs)
+        self._raw_device = device
+        # default device for single-GPU / in-memory paths
         if device is None:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         else:
@@ -143,6 +145,7 @@ class FlashKMeans:
                 verbose=self.verbose,
                 dtype=self.dtype,
                 BLOCK_N=self.chunk_size_data_cpu,
+                device=self._raw_device,
             )
             centroids_b.unsqueeze_(0)
             cluster_ids_b.unsqueeze_(0)
@@ -226,6 +229,7 @@ class FlashKMeans:
                 self.centroids_b[0],
                 dtype=self.dtype,
                 BLOCK_N=self.chunk_size_data_cpu,
+                device=self._raw_device,
             )
             return labels  # (N,)
     
