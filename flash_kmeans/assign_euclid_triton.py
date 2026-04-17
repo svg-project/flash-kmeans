@@ -703,3 +703,4 @@ if __name__ == "__main__":
         torch.testing.assert_close(ref_ids_cos, tri_ids_cos.to(ref_ids_cos.dtype))
     except Exception as e:
         print("Assertion failed:", e)
+
