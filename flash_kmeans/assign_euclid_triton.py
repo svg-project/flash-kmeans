@@ -42,12 +42,152 @@ def _cfg_keep(conf):
 
 _TUNE_CONFIGS = list(filter(_cfg_keep, _TUNE_CONFIGS))
 
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _dtype_bytes(dtype) -> int:
+    """Element size in bytes for a torch / numpy-ish dtype.
+
+    Falls back to 2 (fp16) when the dtype is unknown to keep prior behaviour
+    (the heuristic was originally tuned with fp16 in mind).
+    """
+    if dtype is None:
+        return 2
+    if isinstance(dtype, torch.dtype):
+        return torch.tensor([], dtype=dtype).element_size()
+    # Allow callers to pass a raw byte size.
+    if isinstance(dtype, int):
+        return dtype
+    return 2
+
+
+def _is_half_dtype(dtype) -> bool:
+    """True for fp16/bf16 (the original tuning regime).
+
+    For these dtypes we skip the SMEM-fitting fallback entirely so heuristic
+    selection on already-validated GPUs (H100/H200/A100) is byte-for-byte
+    identical to the previous behaviour.
+    """
+    if dtype is None:
+        return True
+    if isinstance(dtype, torch.dtype):
+        return dtype in _HALF_DTYPES
+    return False
+
+
+def _smem_bytes(D: int, BN: int, BK: int, num_stages: int, dtype_bytes: int) -> int:
+    """Approximate dynamic shared-memory usage of `_euclid_assign_kernel`.
+
+    The kernel materialises:
+    - one ``x_tile`` of shape (BN, D) outside the K loop, and
+    - ``num_stages`` copies of ``c_tile`` of shape (D, BK) for the software
+      pipelined K loop.
+
+    Other buffers (x_sq, c_sq, masks, accumulators) are negligible compared
+    to these and are ignored.
+    """
+    return D * dtype_bytes * (BN + num_stages * BK)
+
+
+def _smem_limit(device) -> int:
+    """Per-block dynamic shared-memory budget for ``device``.
+
+    Triton uses opt-in dynamic shared memory; prefer that attribute when
+    available, fall back to the static limit, and finally to a conservative
+    48 KiB for very old PyTorch builds.
+    """
+    props = torch.cuda.get_device_properties(device)
+    for attr in (
+        "shared_memory_per_block_optin",
+        "max_shared_memory_per_block_optin",
+        "shared_memory_per_block",
+        "max_shared_memory_per_block",
+    ):
+        v = getattr(props, attr, None)
+        if v:
+            return int(v)
+    return 48 * 1024
+
+
+def _fit_config_to_smem(
+    cfg: dict,
+    D: int,
+    dtype_bytes: int,
+    smem_limit: int,
+) -> dict:
+    """Return a config that fits ``smem_limit`` and is closest to ``cfg``.
+
+    The original config is returned unchanged whenever it already fits. If
+    not, we enumerate all power-of-two ``(BLOCK_N, BLOCK_K, num_stages)``
+    that are no larger than the original and pick the one that maximises
+    work-per-program tile (``BLOCK_N * BLOCK_K * num_stages``), breaking
+    ties towards the original aspect ratio. This avoids the pitfall of a
+    pure greedy halving (e.g. shrinking BLOCK_K all the way to 16 when only
+    a single halving was needed).
+
+    Raises ``RuntimeError`` if even ``(BN=16, BK=16, S=1)`` does not fit –
+    this only happens for absurdly large D combined with fp32 on tiny-SMEM
+    GPUs.
+    """
+    BN0 = int(cfg["BLOCK_N"])
+    BK0 = int(cfg["BLOCK_K"])
+    W0 = int(cfg["num_warps"])
+    S0 = int(cfg["num_stages"])
+
+    if _smem_bytes(D, BN0, BK0, S0, dtype_bytes) <= smem_limit:
+        return {"BLOCK_N": BN0, "BLOCK_K": BK0, "num_warps": W0, "num_stages": S0}
+
+    def _pow2_down_to_16(v):
+        out = []
+        x = v
+        while x >= 16:
+            out.append(x)
+            x //= 2
+        return out
+
+    best = None
+    best_key = None
+    for BN in _pow2_down_to_16(BN0):
+        for BK in _pow2_down_to_16(BK0):
+            for S in range(S0, 0, -1):
+                if _smem_bytes(D, BN, BK, S, dtype_bytes) > smem_limit:
+                    continue
+                # Prefer larger total tile work, then closer aspect ratio
+                # to the original, then larger BLOCK_N (more parallelism
+                # along N), then larger num_stages (better pipelining).
+                aspect_penalty = abs(
+                    (BN / max(BK, 1)) - (BN0 / max(BK0, 1))
+                )
+                key = (BN * BK * S, -aspect_penalty, BN, S)
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best = (BN, BK, S)
+
+    if best is None:
+        raise RuntimeError(
+            f"euclid_assign_triton: cannot fit kernel into shared memory "
+            f"(D={D}, dtype_bytes={dtype_bytes}, smem_limit={smem_limit}). "
+            f"Even BLOCK_N=16, BLOCK_K=16, num_stages=1 needs "
+            f"{_smem_bytes(D, 16, 16, 1, dtype_bytes)} bytes."
+        )
+
+    BN, BK, S = best
+    W = W0
+    # Tiny tiles do not benefit from many warps and may even fail to compile
+    # for some Triton versions; cap to 4.
+    if BN * BK <= 32 * 32 and W > 4:
+        W = 4
+
+    return {"BLOCK_N": BN, "BLOCK_K": BK, "num_warps": W, "num_stages": S}
+
+
 def _heuristic_euclid_config(
     N: int,
     K: int,
     D: int,
     *,
     device: Optional[torch.device] = None,
+    dtype=None,
 ):
     """Architecture-aware heuristic config selection without autotune.
 
@@ -57,10 +197,27 @@ def _heuristic_euclid_config(
     - A100: heuristic derived from A100 grid tuning results
     - GB10: heuristic derived from GB10 grid tuning results
     - others: conservative fallback to reduce OOR risk
+
+    For half-precision dtypes (fp16/bf16, the regime the per-arch tables
+    were tuned in) the picked config is returned as-is so behaviour on
+    H100/H200/A100 stays byte-for-byte identical. For wider dtypes (fp32
+    and friends) we additionally pass the config through
+    ``_fit_config_to_smem`` so the kernel does not OOR on small-SMEM GPUs.
     """
     if device is None:
         device = torch.device("cuda")
     gpu_name = torch.cuda.get_device_properties(device).name.upper()
+
+    if _is_half_dtype(dtype):
+        # Original code path: trust the per-arch table without SMEM checks.
+        def _finalize(cfg):
+            return cfg
+    else:
+        dtype_bytes = _dtype_bytes(dtype)
+        smem_limit = _smem_limit(device)
+
+        def _finalize(cfg):
+            return _fit_config_to_smem(cfg, D, dtype_bytes, smem_limit)
 
     if "H200" in gpu_name:
         # Keep the original H200 heuristic as-is.
@@ -105,12 +262,12 @@ def _heuristic_euclid_config(
         if N < 65536:
             block_n = 64
 
-        return {
+        return _finalize({
             "BLOCK_N": block_n,
             "BLOCK_K": block_k,
             "num_warps": num_warps,
             "num_stages": num_stages,
-        }
+        })
 
     if "H100" in gpu_name:
         # H100 tuned heuristic (more conservative on D=64 mid-K vs H200).
@@ -173,12 +330,12 @@ def _heuristic_euclid_config(
         if N < 65536:
             block_n = 64
 
-        return {
+        return _finalize({
             "BLOCK_N": block_n,
             "BLOCK_K": block_k,
             "num_warps": num_warps,
             "num_stages": num_stages,
-        }
+        })
 
     if "A100" in gpu_name:
         # Robust default on A100 across tuned grid.
@@ -200,61 +357,64 @@ def _heuristic_euclid_config(
                 block_k = 64
                 num_stages = 4
 
-        return {
+        return _finalize({
             "BLOCK_N": block_n,
             "BLOCK_K": block_k,
             "num_warps": num_warps,
             "num_stages": num_stages,
-        }
+        })
 
     if "GB10" in gpu_name:
-        # GB10 (Grace Blackwell, ~80 SMs) tuned heuristic. Derived from a grid
-        # sweep over N in {65536, 262144, 1048576}, K in {256..200000},
-        # D in {64,128,256,512}, B in {1, 32}, fp16. Geomean slowdown vs. the
-        # per-shape optimum is ~1% across the sweep (worst case ~9% on
-        # sub-millisecond ops where timing noise dominates).
+        # GB10 (Grace Blackwell, ~80 SMs, ~99 KiB SMEM/SM) tuned heuristic.
+        # Derived from a grid sweep over N in {65536, 262144, 1048576},
+        # K in {256..200000}, D in {64,128,256,512}, B in {1, 32}, fp16.
+        # Geomean slowdown vs. per-shape optimum is ~1% across the sweep
+        # (worst case ~9% on sub-millisecond ops where timing noise
+        # dominates). The selected config is post-processed by
+        # _fit_config_to_smem so fp32 / large D inputs are shrunk to fit
+        # GB10's modest shared-memory budget.
         if D >= 512:
             # D=512 strongly prefers a small BLOCK_N with 8 warps, except for
             # very small K where 4 warps is enough to saturate.
             if K <= 256:
-                return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
-            return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 8, "num_stages": 1}
+                return _finalize({"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
+            return _finalize({"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 8, "num_stages": 1})
 
         if D >= 256:
             if K <= 256:
-                return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+                return _finalize({"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
             # Deeper pipeline + wider K tile pays off for K>=1024 at D=256.
-            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 2}
+            return _finalize({"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 2})
 
         if D >= 128:
             if K <= 256:
                 # Small K: a more square tile wins (BN=64, BK=64).
-                return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+                return _finalize({"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
             if K <= 1024:
                 # Transition region: small N likes a square tile, large N
                 # benefits from BN=128 with deeper pipeline.
                 if N <= 65536:
-                    return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
-                return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2}
+                    return _finalize({"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
+                return _finalize({"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2})
             if K <= 65536:
-                return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+                return _finalize({"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
             # K > 65536 (e.g. 200k) prefers the wider K tile to amortize loads.
-            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+            return _finalize({"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
 
         # D <= 64: BN=128, BK=32, 4 warps is robust across the full grid.
         # Only the tiniest shapes (small N + small K) shift toward a square
         # BN=64/BK=64 tile; larger N keeps the wider BN=128 default.
         if K <= 256 and N <= 65536:
-            return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
-        return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+            return _finalize({"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
+        return _finalize({"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
 
     # Conservative fallback for unknown architectures (prioritize avoiding OOR).
-    return {
+    return _finalize({
         "BLOCK_N": 64,
         "BLOCK_K": 32,
         "num_warps": 4,
         "num_stages": 1,
-    }
+    })
 
 
 @triton.jit
@@ -536,7 +696,9 @@ def euclid_assign_triton(
             "num_stages": num_stages,
         }
     elif use_heuristic:
-        selected_config = _heuristic_euclid_config(N, K, D, device=x.device)
+        selected_config = _heuristic_euclid_config(
+            N, K, D, device=x.device, dtype=x.dtype
+        )
 
     if selected_config is not None:
         _euclid_assign_kernel[grid](
@@ -703,4 +865,3 @@ if __name__ == "__main__":
         torch.testing.assert_close(ref_ids_cos, tri_ids_cos.to(ref_ids_cos.dtype))
     except Exception as e:
         print("Assertion failed:", e)
-
