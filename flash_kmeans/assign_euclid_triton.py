@@ -53,7 +53,9 @@ def _heuristic_euclid_config(
 
     Keep one unified heuristic entry and diverge inside by GPU family:
     - H200: existing hand-tuned heuristic
+    - H100: heuristic derived from H100 grid tuning results
     - A100: heuristic derived from A100 grid tuning results
+    - GB10: heuristic derived from GB10 grid tuning results
     - others: conservative fallback to reduce OOR risk
     """
     if device is None:
@@ -204,6 +206,47 @@ def _heuristic_euclid_config(
             "num_warps": num_warps,
             "num_stages": num_stages,
         }
+
+    if "GB10" in gpu_name:
+        # GB10 (Grace Blackwell, ~80 SMs) tuned heuristic. Derived from a grid
+        # sweep over N in {65536, 262144, 1048576}, K in {256..200000},
+        # D in {64,128,256,512}, B in {1, 32}, fp16. Geomean slowdown vs. the
+        # per-shape optimum is ~1% across the sweep (worst case ~9% on
+        # sub-millisecond ops where timing noise dominates).
+        if D >= 512:
+            # D=512 strongly prefers a small BLOCK_N with 8 warps, except for
+            # very small K where 4 warps is enough to saturate.
+            if K <= 256:
+                return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+            return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 8, "num_stages": 1}
+
+        if D >= 256:
+            if K <= 256:
+                return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+            # Deeper pipeline + wider K tile pays off for K>=1024 at D=256.
+            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 2}
+
+        if D >= 128:
+            if K <= 256:
+                # Small K: a more square tile wins (BN=64, BK=64).
+                return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+            if K <= 1024:
+                # Transition region: small N likes a square tile, large N
+                # benefits from BN=128 with deeper pipeline.
+                if N <= 65536:
+                    return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+                return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2}
+            if K <= 65536:
+                return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+            # K > 65536 (e.g. 200k) prefers the wider K tile to amortize loads.
+            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+
+        # D <= 64: BN=128, BK=32, 4 warps is robust across the full grid.
+        # Only the tiniest shapes (small N + small K) shift toward a square
+        # BN=64/BK=64 tile; larger N keeps the wider BN=128 default.
+        if K <= 256 and N <= 65536:
+            return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+        return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
 
     # Conservative fallback for unknown architectures (prioritize avoiding OOR).
     return {
