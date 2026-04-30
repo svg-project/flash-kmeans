@@ -604,8 +604,12 @@ def _cosine_assign_kernel(
         # Compute cosine distance (BLOCK_N, BLOCK_K) = x_tile @ c_tile
         cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
 
-        # Mask out invalid centroid columns before reduction
-        dist = tl.where(k_mask[None, :], cross, 0.0)
+        # Mask out invalid centroid columns before reduction.
+        # Use a sentinel below any real cosine/dot score so masked tail lanes
+        # never win the argmax. (0.0 is a real cosine value: any input row whose
+        # cosine to all real centroids is < 0 would otherwise route to a masked
+        # lane, returning an out-of-range cluster id.)
+        dist = tl.where(k_mask[None, :], cross, -torch.finfo(torch.float32).max)
 
         curr_max = tl.max(dist, axis=1)
         curr_idx = tl.argmax(dist, axis=1)
