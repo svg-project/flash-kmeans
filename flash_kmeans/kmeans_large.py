@@ -266,6 +266,11 @@ def kmeans_largeN(
 
                 reduce_done_event.record(reduce_stream[primary_gpu])
 
+        # Ensure all GPUs see the broadcast before next iteration
+        for g in active_gpus:
+            if g != primary_gpu:
+                reduce_stream[g].wait_event(reduce_done_event)
+
     # Phase 4: Sync and gather results
     reduce_stream[primary_gpu].synchronize()
 
