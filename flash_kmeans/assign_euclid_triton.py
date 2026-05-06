@@ -42,6 +42,43 @@ def _cfg_keep(conf):
 
 _TUNE_CONFIGS = list(filter(_cfg_keep, _TUNE_CONFIGS))
 
+
+# Tuning grid for the split-D kernel. Adds a third tile dim ``BLOCK_D``
+# that controls how much of the feature dimension is materialised inside
+# each program at a time. Pruned to keep peak SMEM and register pressure
+# under control on conservative GPUs (GB10).
+_TUNE_CONFIGS_SPLIT_D = [
+    triton.Config({"BLOCK_N": BN, "BLOCK_K": BK, "BLOCK_D": BD},
+                  num_stages=num_stages, num_warps=wp)
+    for BN in [32, 64, 128]
+    for BK in [32, 64, 128]
+    for BD in [32, 64, 128]
+    for wp in [4, 8]
+    for num_stages in [1, 2, 4]
+]
+
+
+def _cfg_keep_split_d(conf):
+    BN = conf.kwargs["BLOCK_N"]
+    BK = conf.kwargs["BLOCK_K"]
+    BD = conf.kwargs["BLOCK_D"]
+    # Tiny tiles do not need many warps.
+    if BN * BK < 32 * 32 and conf.num_warps > 4:
+        return False
+    # Cap (BN, BK) tile size for register/SMEM safety. The (BN, BK) fp32
+    # cross accumulator is the same size as the small-D kernel, so keeping
+    # BN*BK <= 128*128 prevents new spill regressions.
+    if BN * BK > 128 * 128:
+        return False
+    # Prune the largest combined work tiles to keep tuning wall-clock down
+    # without losing useful configs.
+    if BN * BK * BD > 128 * 128 * 128:
+        return False
+    return True
+
+
+_TUNE_CONFIGS_SPLIT_D = list(filter(_cfg_keep_split_d, _TUNE_CONFIGS_SPLIT_D))
+
 _HALF_DTYPES = (torch.float16, torch.bfloat16)
 
 
@@ -181,6 +218,334 @@ def _fit_config_to_smem(
     return {"BLOCK_N": BN, "BLOCK_K": BK, "num_warps": W, "num_stages": S}
 
 
+def _smem_bytes_split_d(BD: int, BN: int, BK: int, num_stages: int, dtype_bytes: int) -> int:
+    """SMEM estimate for ``_euclid_assign_kernel_split_d`` per program.
+
+    The split-D kernel materialises:
+    - one ``x_chunk`` of shape (BN, BD) per D-tile, and
+    - ``num_stages`` copies of ``c_chunk`` of shape (BD, BK) for the software
+      pipelined inner D loop.
+    """
+    return BD * dtype_bytes * (BN + num_stages * BK)
+
+
+def _smallD_kernel_fits_smem(D: int, dtype_bytes: int, smem_limit: int) -> bool:
+    """Return True if even the tiniest small-D kernel config fits SMEM.
+
+    Used by the wrapper to fall back to split-D when the small-D kernel can
+    not run at all (e.g., GB10 + fp32 + D=448).
+    """
+    return _smem_bytes(D, 16, 16, 1, dtype_bytes) <= smem_limit
+
+
+def _fit_config_to_smem_split_d(
+    cfg: dict,
+    D: int,
+    dtype_bytes: int,
+    smem_limit: int,
+) -> dict:
+    """Shrink a split-D config until it fits ``smem_limit``.
+
+    Mirrors ``_fit_config_to_smem`` with the additional ``BLOCK_D`` axis.
+    Returns the largest-work config that fits, breaking ties towards the
+    original aspect ratio. ``BLOCK_D`` is also clamped to D when D < BD0
+    (no point materialising more dims than exist).
+    """
+    BN0 = int(cfg["BLOCK_N"])
+    BK0 = int(cfg["BLOCK_K"])
+    W0 = int(cfg["num_warps"])
+    S0 = int(cfg["num_stages"])
+    BD0 = int(cfg["BLOCK_D"])
+    # No point letting BD exceed D (the loop would still run once).
+    BD0 = min(BD0, max(D, 16))
+
+    if _smem_bytes_split_d(BD0, BN0, BK0, S0, dtype_bytes) <= smem_limit:
+        return {
+            "BLOCK_N": BN0, "BLOCK_K": BK0, "BLOCK_D": BD0,
+            "num_warps": W0, "num_stages": S0,
+        }
+
+    def _pow2_down_to_16(v):
+        out = []
+        x = v
+        while x >= 16:
+            out.append(x)
+            x //= 2
+        return out
+
+    best = None
+    best_key = None
+    for BN in _pow2_down_to_16(BN0):
+        for BK in _pow2_down_to_16(BK0):
+            for BD in _pow2_down_to_16(BD0):
+                for S in range(S0, 0, -1):
+                    if _smem_bytes_split_d(BD, BN, BK, S, dtype_bytes) > smem_limit:
+                        continue
+                    aspect_penalty = abs(
+                        (BN / max(BK, 1)) - (BN0 / max(BK0, 1))
+                    )
+                    key = (BN * BK * BD * S, -aspect_penalty, BN, BD, S)
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best = (BN, BK, BD, S)
+
+    if best is None:
+        raise RuntimeError(
+            f"euclid_assign_triton (split-D): cannot fit kernel into shared "
+            f"memory (D={D}, dtype_bytes={dtype_bytes}, smem_limit={smem_limit})."
+        )
+
+    BN, BK, BD, S = best
+    W = W0
+    if BN * BK <= 32 * 32 and W > 4:
+        W = 4
+    return {
+        "BLOCK_N": BN, "BLOCK_K": BK, "BLOCK_D": BD,
+        "num_warps": W, "num_stages": S,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Per-arch small-D heuristic functions. These bodies are the original
+# hand-tuned tables, moved verbatim here so the top-level dispatcher stays
+# small and so the split-D path can live alongside without touching them.
+# Any change here must be guarded by examples/regression_fp16_smalld.py.
+# -----------------------------------------------------------------------------
+
+
+def _heuristic_euclid_config_h200_smallD(N: int, K: int, D: int, dtype) -> dict:
+    if not _is_half_dtype(dtype):
+        # H200 fp32 small-D table, derived from a focused grid sweep
+        # (N ∈ {65536, 262144, 1048576}, K ∈ {256..200000}, B=1).
+        # The kernel SMEM scales with `D * dtype_bytes`, so fp32 prefers
+        # narrower tiles than fp16 — especially at D=512 where only the
+        # smallest BN/BK combo fits H200's 226 KiB per-block budget.
+        if D <= 64:
+            if K <= 256:
+                return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+            if K <= 65536:
+                return {"BLOCK_N": 128, "BLOCK_K": 128, "num_warps": 8, "num_stages": 2}
+            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 4}
+        if D <= 128:
+            if K <= 256:
+                return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
+            if K <= 16384:
+                return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
+        if D <= 256:
+            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
+        # D == 512 (or 320/384/448 — any value the small-D kernel still
+        # accepts but only fits with the smallest tile under fp32).
+        return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+
+    # fp16/bf16 path: original hand-tuned table — leave byte-for-byte
+    # identical so examples/regression_fp16_smalld.py keeps passing.
+    block_n = 128
+    block_k = 64
+    num_warps = 4
+    num_stages = 1
+
+    if D >= 512:
+        block_n = 128
+        block_k = 64
+        num_warps = 8
+        num_stages = 1
+    elif D >= 256:
+        block_n = 128
+        block_k = 64
+        num_warps = 4
+        num_stages = 2
+    else:
+        # D <= 128
+        if K >= 4096:
+            block_k = 128
+            if D >= 128:
+                num_warps = 8
+                num_stages = 2
+            else:
+                num_warps = 4
+                num_stages = 4
+        else:
+            block_k = 64
+            num_warps = 4
+            num_stages = 1
+
+    # D=64 with large K tends to prefer smaller BLOCK_N and deeper pipeline.
+    if D <= 64 and K >= 4096:
+        block_n = 64
+        block_k = 128
+        num_warps = 4
+        num_stages = 4
+
+    # Smaller N favors smaller BLOCK_N to reduce wasted work.
+    if N < 65536:
+        block_n = 64
+
+    return {
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+def _heuristic_euclid_config_h100_smallD(N: int, K: int, D: int, dtype) -> dict:
+    # H100 tuned heuristic (more conservative on D=64 mid-K vs H200).
+    block_n = 128
+    block_k = 64
+    num_warps = 4
+    num_stages = 1
+
+    if D >= 512:
+        block_n = 128
+        block_k = 64
+        num_warps = 8
+        num_stages = 1
+    elif D >= 256:
+        block_n = 128
+        block_k = 64
+        if K <= 1024:
+            num_warps = 8
+            num_stages = 1
+        elif K <= 16384:
+            num_warps = 4
+            num_stages = 1
+        else:
+            num_warps = 8
+            num_stages = 1
+    else:
+        # D <= 128
+        if D <= 64:
+            if K <= 1024:
+                block_k = 64
+                num_warps = 4
+                num_stages = 2
+            elif K <= 16384:
+                block_k = 64
+                num_warps = 4
+                num_stages = 2
+            elif K <= 65536:
+                block_k = 128
+                num_warps = 4
+                num_stages = 4
+            else:
+                block_k = 64
+                num_warps = 4
+                num_stages = 4
+        else:
+            # D == 128
+            if K <= 1024:
+                block_k = 64
+                num_warps = 4
+                num_stages = 1
+            elif K <= 65536:
+                block_k = 128
+                num_warps = 8
+                num_stages = 2
+            else:
+                block_k = 64
+                num_warps = 4
+                num_stages = 4
+
+    if N < 65536:
+        block_n = 64
+
+    return {
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+def _heuristic_euclid_config_a100_smallD(N: int, K: int, D: int, dtype) -> dict:
+    # Robust default on A100 across tuned grid.
+    block_n = 128
+    block_k = 32
+    num_warps = 4
+    num_stages = 2
+
+    if D == 128:
+        # Small-N cases tend to prefer a larger K tile.
+        if N <= 65536:
+            block_k = 64
+    elif D == 256:
+        # D=256 benefits from deeper pipeline at larger K.
+        if K >= 65536:
+            block_k = 32
+            num_stages = 4
+        elif K >= 1024 and N <= 262144:
+            block_k = 64
+            num_stages = 4
+
+    return {
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+def _heuristic_euclid_config_gb10_smallD(N: int, K: int, D: int, dtype) -> dict:
+    # GB10 (Grace Blackwell, ~80 SMs, ~99 KiB SMEM/SM) tuned heuristic.
+    # Derived from a grid sweep over N in {65536, 262144, 1048576},
+    # K in {256..200000}, D in {64,128,256,512}, B in {1, 32}, fp16.
+    if D >= 512:
+        if K <= 256:
+            return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+        return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 8, "num_stages": 1}
+
+    if D >= 256:
+        if K <= 256:
+            return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+        return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 2}
+
+    if D >= 128:
+        if K <= 256:
+            return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+        if K <= 1024:
+            if N <= 65536:
+                return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+            return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2}
+        if K <= 65536:
+            return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+        return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+
+    # D <= 64
+    if K <= 256 and N <= 65536:
+        return {"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+    return {"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+
+
+def _heuristic_euclid_config_fallback_smallD(N: int, K: int, D: int, dtype) -> dict:
+    # Conservative default for unknown architectures (prioritize avoiding OOR).
+    return {
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
+
+
+_KNOWN_ARCHS = ("H200", "H100", "A100", "GB10")
+
+
+def _is_known_arch(gpu_name: str) -> bool:
+    return any(tag in gpu_name for tag in _KNOWN_ARCHS)
+
+
+def _arch_smallD_picker(gpu_name: str):
+    if "H200" in gpu_name:
+        return _heuristic_euclid_config_h200_smallD
+    if "H100" in gpu_name:
+        return _heuristic_euclid_config_h100_smallD
+    if "A100" in gpu_name:
+        return _heuristic_euclid_config_a100_smallD
+    if "GB10" in gpu_name:
+        return _heuristic_euclid_config_gb10_smallD
+    return _heuristic_euclid_config_fallback_smallD
+
+
 def _heuristic_euclid_config(
     N: int,
     K: int,
@@ -191,230 +556,185 @@ def _heuristic_euclid_config(
 ):
     """Architecture-aware heuristic config selection without autotune.
 
-    Keep one unified heuristic entry and diverge inside by GPU family:
-    - H200: existing hand-tuned heuristic
-    - H100: heuristic derived from H100 grid tuning results
-    - A100: heuristic derived from A100 grid tuning results
-    - GB10: heuristic derived from GB10 grid tuning results
-    - others: conservative fallback to reduce OOR risk
+    Per-GPU sub-functions own the actual lookup tables. This function only
+    routes to the right one and (for non-half dtypes) post-processes the
+    config through ``_fit_config_to_smem`` so fp32 / large-D inputs do not
+    OOR on small-SMEM GPUs.
 
-    For half-precision dtypes (fp16/bf16, the regime the per-arch tables
-    were tuned in) the picked config is returned as-is so behaviour on
-    H100/H200/A100 stays byte-for-byte identical. For wider dtypes (fp32
-    and friends) we additionally pass the config through
-    ``_fit_config_to_smem`` so the kernel does not OOR on small-SMEM GPUs.
+    For fp16/bf16 the picked config is returned **byte-for-byte** as the
+    original tables produced (``examples/regression_fp16_smalld.py``
+    enforces this).
     """
     if device is None:
         device = torch.device("cuda")
     gpu_name = torch.cuda.get_device_properties(device).name.upper()
 
+    cfg = _arch_smallD_picker(gpu_name)(N, K, D, dtype)
+
     if _is_half_dtype(dtype):
-        # Original code path: trust the per-arch table without SMEM checks.
-        def _finalize(cfg):
-            return cfg
-    else:
-        dtype_bytes = _dtype_bytes(dtype)
-        smem_limit = _smem_limit(device)
+        return cfg
 
-        def _finalize(cfg):
-            return _fit_config_to_smem(cfg, D, dtype_bytes, smem_limit)
+    dtype_bytes = _dtype_bytes(dtype)
+    smem_limit = _smem_limit(device)
+    return _fit_config_to_smem(cfg, D, dtype_bytes, smem_limit)
 
-    if "H200" in gpu_name:
-        # Keep the original H200 heuristic as-is.
-        block_n = 128
-        block_k = 64
-        num_warps = 4
-        num_stages = 1
 
-        if D >= 512:
-            block_n = 128
-            block_k = 64
-            num_warps = 8
-            num_stages = 1
-        elif D >= 256:
-            block_n = 128
-            block_k = 64
-            num_warps = 4
-            num_stages = 2
-        else:
-            # D <= 128
-            if K >= 4096:
-                block_k = 128
-                if D >= 128:
-                    num_warps = 8
-                    num_stages = 2
-                else:
-                    num_warps = 4
-                    num_stages = 4
-            else:
-                block_k = 64
-                num_warps = 4
-                num_stages = 1
+# -----------------------------------------------------------------------------
+# Split-D heuristic. Per-arch tables stay conservative for now and rely on
+# ``_fit_config_to_smem_split_d`` for SMEM safety. H200 has the only freshly
+# tuned table; H100/A100/GB10 use the same defaults until tuning data lands.
+# -----------------------------------------------------------------------------
 
-        # D=64 with large K tends to prefer smaller BLOCK_N and deeper pipeline.
-        if D <= 64 and K >= 4096:
-            block_n = 64
-            block_k = 128
-            num_warps = 4
-            num_stages = 4
 
-        # Smaller N favors smaller BLOCK_N to reduce wasted work.
-        if N < 65536:
-            block_n = 64
+def _heuristic_euclid_config_h200_largeD(N: int, K: int, D: int, dtype) -> dict:
+    """H200 split-D heuristic.
 
-        return _finalize({
-            "BLOCK_N": block_n,
-            "BLOCK_K": block_k,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        })
+    Derived from a focused grid sweep over D ∈ {1024, 2048, 4096},
+    K ∈ {256..65536}, N ∈ {65536, 262144, 1048576}, B=1, fp16+fp32.
+    Patterns:
+      - fp16/bf16 (2 bytes): wide tile (BN=128, BK=128) with BD=64 is the
+        clear winner across D=1024 and D=4096 (3/3 N votes per K bucket).
+        D=2048 with K ≥ 4096 prefers the deeper-D tile (BN=64, BK=128, BD=128)
+        because the centroid stream dominates and a fatter D chunk amortises
+        loads better.
+      - fp32 (4 bytes): same shape but BD shrinks to 32 to keep SMEM under
+        budget. D=1024 with K ≥ 4096 splits BN→64 and grows BD→64 (more
+        D-axis amortisation when the centroid set is large).
+    """
+    half = _is_half_dtype(dtype)
 
-    if "H100" in gpu_name:
-        # H100 tuned heuristic (more conservative on D=64 mid-K vs H200).
-        block_n = 128
-        block_k = 64
-        num_warps = 4
-        num_stages = 1
-
-        if D >= 512:
-            block_n = 128
-            block_k = 64
-            num_warps = 8
-            num_stages = 1
-        elif D >= 256:
-            block_n = 128
-            block_k = 64
+    if half:
+        if D >= 4096:
+            return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 64,
+                    "num_warps": 8, "num_stages": 4}
+        if D >= 2048:
             if K <= 1024:
-                num_warps = 8
-                num_stages = 1
-            elif K <= 16384:
-                num_warps = 4
-                num_stages = 1
-            else:
-                num_warps = 8
-                num_stages = 1
-        else:
-            # D <= 128
-            if D <= 64:
-                if K <= 1024:
-                    block_k = 64
-                    num_warps = 4
-                    num_stages = 2
-                elif K <= 16384:
-                    block_k = 64
-                    num_warps = 4
-                    num_stages = 2
-                elif K <= 65536:
-                    block_k = 128
-                    num_warps = 4
-                    num_stages = 4
-                else:
-                    block_k = 64
-                    num_warps = 4
-                    num_stages = 4
-            else:
-                # D == 128
-                if K <= 1024:
-                    block_k = 64
-                    num_warps = 4
-                    num_stages = 1
-                elif K <= 65536:
-                    block_k = 128
-                    num_warps = 8
-                    num_stages = 2
-                else:
-                    block_k = 64
-                    num_warps = 4
-                    num_stages = 4
+                return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 64,
+                        "num_warps": 8, "num_stages": 4}
+            return {"BLOCK_N": 64, "BLOCK_K": 128, "BLOCK_D": 128,
+                    "num_warps": 4, "num_stages": 4}
+        # D ≈ 1024 (also covers D in (512, 1024) when small-D kernel doesn't fit)
+        return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 64,
+                "num_warps": 8, "num_stages": 4}
 
-        if N < 65536:
-            block_n = 64
+    # fp32 / wider
+    if D >= 2048:
+        return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 32,
+                "num_warps": 8, "num_stages": 4}
+    # D ≈ 1024 fp32
+    if K <= 1024:
+        return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 32,
+                "num_warps": 8, "num_stages": 4}
+    return {"BLOCK_N": 64, "BLOCK_K": 128, "BLOCK_D": 64,
+            "num_warps": 4, "num_stages": 4}
 
-        return _finalize({
-            "BLOCK_N": block_n,
-            "BLOCK_K": block_k,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        })
 
-    if "A100" in gpu_name:
-        # Robust default on A100 across tuned grid.
-        block_n = 128
-        block_k = 32
-        num_warps = 4
-        num_stages = 2
+def _heuristic_euclid_config_h100_largeD(N: int, K: int, D: int, dtype) -> dict:
+    return {
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "BLOCK_D": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
 
-        if D == 128:
-            # Small-N cases tend to prefer a larger K tile.
-            if N <= 65536:
-                block_k = 64
-        elif D == 256:
-            # D=256 benefits from deeper pipeline at larger K.
-            if K >= 65536:
-                block_k = 32
-                num_stages = 4
-            elif K >= 1024 and N <= 262144:
-                block_k = 64
-                num_stages = 4
 
-        return _finalize({
-            "BLOCK_N": block_n,
-            "BLOCK_K": block_k,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        })
-
-    if "GB10" in gpu_name:
-        # GB10 (Grace Blackwell, ~80 SMs, ~99 KiB SMEM/SM) tuned heuristic.
-        # Derived from a grid sweep over N in {65536, 262144, 1048576},
-        # K in {256..200000}, D in {64,128,256,512}, B in {1, 32}, fp16.
-        # Geomean slowdown vs. per-shape optimum is ~1% across the sweep
-        # (worst case ~9% on sub-millisecond ops where timing noise
-        # dominates). The selected config is post-processed by
-        # _fit_config_to_smem so fp32 / large D inputs are shrunk to fit
-        # GB10's modest shared-memory budget.
-        if D >= 512:
-            # D=512 strongly prefers a small BLOCK_N with 8 warps, except for
-            # very small K where 4 warps is enough to saturate.
-            if K <= 256:
-                return _finalize({"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
-            return _finalize({"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 8, "num_stages": 1})
-
-        if D >= 256:
-            if K <= 256:
-                return _finalize({"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
-            # Deeper pipeline + wider K tile pays off for K>=1024 at D=256.
-            return _finalize({"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 2})
-
-        if D >= 128:
-            if K <= 256:
-                # Small K: a more square tile wins (BN=64, BK=64).
-                return _finalize({"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
-            if K <= 1024:
-                # Transition region: small N likes a square tile, large N
-                # benefits from BN=128 with deeper pipeline.
-                if N <= 65536:
-                    return _finalize({"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
-                return _finalize({"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2})
-            if K <= 65536:
-                return _finalize({"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
-            # K > 65536 (e.g. 200k) prefers the wider K tile to amortize loads.
-            return _finalize({"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
-
-        # D <= 64: BN=128, BK=32, 4 warps is robust across the full grid.
-        # Only the tiniest shapes (small N + small K) shift toward a square
-        # BN=64/BK=64 tile; larger N keeps the wider BN=128 default.
-        if K <= 256 and N <= 65536:
-            return _finalize({"BLOCK_N": 64, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1})
-        return _finalize({"BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1})
-
-    # Conservative fallback for unknown architectures (prioritize avoiding OOR).
-    return _finalize({
+def _heuristic_euclid_config_a100_largeD(N: int, K: int, D: int, dtype) -> dict:
+    return {
         "BLOCK_N": 64,
         "BLOCK_K": 32,
+        "BLOCK_D": 32,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+
+
+def _heuristic_euclid_config_gb10_largeD(N: int, K: int, D: int, dtype) -> dict:
+    return {
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "BLOCK_D": 32,
         "num_warps": 4,
         "num_stages": 1,
-    })
+    }
+
+
+def _heuristic_euclid_config_fallback_largeD(N: int, K: int, D: int, dtype) -> dict:
+    return {
+        "BLOCK_N": 32,
+        "BLOCK_K": 32,
+        "BLOCK_D": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
+
+
+def _arch_largeD_picker(gpu_name: str):
+    if "H200" in gpu_name:
+        return _heuristic_euclid_config_h200_largeD
+    if "H100" in gpu_name:
+        return _heuristic_euclid_config_h100_largeD
+    if "A100" in gpu_name:
+        return _heuristic_euclid_config_a100_largeD
+    if "GB10" in gpu_name:
+        return _heuristic_euclid_config_gb10_largeD
+    return _heuristic_euclid_config_fallback_largeD
+
+
+def _heuristic_euclid_config_split_d(
+    N: int,
+    K: int,
+    D: int,
+    *,
+    device: Optional[torch.device] = None,
+    dtype=None,
+):
+    """Heuristic config picker for the split-D Euclid assign kernel.
+
+    Always post-processes through ``_fit_config_to_smem_split_d`` so the
+    selected config is guaranteed to fit SMEM regardless of dtype/D.
+    """
+    if device is None:
+        device = torch.device("cuda")
+    gpu_name = torch.cuda.get_device_properties(device).name.upper()
+    cfg = _arch_largeD_picker(gpu_name)(N, K, D, dtype)
+    dtype_bytes = _dtype_bytes(dtype)
+    smem_limit = _smem_limit(device)
+    return _fit_config_to_smem_split_d(cfg, D, dtype_bytes, smem_limit)
+
+
+# Hard threshold: D > this triggers split-D dispatch even when SMEM would
+# nominally fit, so the fp16/bf16/fp32 + D ≤ 512 regime stays on the
+# original kernel path (matches the regime the existing tables were tuned
+# in). Larger D goes through the split-D path.
+_SMALL_D_MAX = 512
+
+
+def _need_split_d(D: int, dtype, device) -> bool:
+    """Decide whether to dispatch to the split-D kernel.
+
+    Split-D is needed when:
+      1. D exceeds the small-D regime (the original kernel can't tile D).
+      2. The small-D kernel cannot fit even at minimum tile (BN=16, BK=16,
+         S=1) — SMEM safety net for awkward dtype/D/GPU triples.
+      3. The GPU is unknown to the heuristic. The small-D path relies on
+         per-arch tuning tables; on unfamiliar architectures we have no
+         data to trust those configs and the SMEM probe may also be
+         unreliable. Split-D with the conservative fallback (small BN/BK/BD,
+         num_stages=1) is the safer choice — `_fit_config_to_smem_split_d`
+         then guarantees the launch fits regardless of how small the SMEM
+         budget actually turns out to be.
+    """
+    if D > _SMALL_D_MAX:
+        return True
+    if device is None:
+        device = torch.device("cuda")
+    gpu_name = torch.cuda.get_device_properties(device).name.upper()
+    if not _is_known_arch(gpu_name):
+        return True
+    dtype_bytes = _dtype_bytes(dtype)
+    smem_limit = _smem_limit(device)
+    return not _smallD_kernel_fits_smem(D, dtype_bytes, smem_limit)
 
 
 @triton.jit
@@ -530,6 +850,123 @@ def _euclid_assign_kernel(
 
 _euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_euclid_assign_kernel)
 
+
+# ===============================================================
+# Split-D Euclid assign kernel.
+#
+# This kernel mirrors ``_euclid_assign_kernel`` but tiles the feature
+# dimension D into chunks of size ``BLOCK_D`` so the per-program SMEM
+# footprint is bounded by BLOCK_D rather than D. The K-streaming property
+# (no full distance matrix materialised) is preserved: outer loop is K,
+# inner D loop accumulates ``cross (BN, BK)`` in registers across D chunks,
+# distance and best-index are computed at the end of each K iteration.
+# ===============================================================
+@triton.jit
+def _euclid_assign_kernel_split_d(
+    x_ptr,                 # *f16 / *f32 [B, N, D]
+    c_ptr,                 # *f16 / *f32 [B, K, D]
+    x_sq_ptr,              # *f32         [B, N]
+    c_sq_ptr,              # *f32         [B, K]
+    out_ptr,               # *i32         [B, N]
+    B: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    stride_x_b: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_k: tl.constexpr,
+    stride_c_d: tl.constexpr,
+    stride_xsq_b: tl.constexpr,
+    stride_xsq_n: tl.constexpr,
+    stride_csq_b: tl.constexpr,
+    stride_csq_k: tl.constexpr,
+    stride_out_b: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_b = pid_b.to(tl.int64)
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_offsets = n_offsets.to(tl.int64)
+    n_mask = n_offsets < N
+
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
+
+    # Pre-load x_sq for the tile (BLOCK_N,)
+    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
+    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_offsets = k_offsets.to(tl.int64)
+        k_mask = k_offsets < K
+
+        csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
+        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+        # cross accumulator lives in registers across the D loop.
+        cross = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+
+        for d_start in range(0, D, BLOCK_D):
+            d_offsets = d_start + offs_d
+            d_mask = d_offsets < D
+
+            x_ptrs = (
+                x_ptr
+                + pid_b * stride_x_b
+                + n_offsets[:, None] * stride_x_n
+                + d_offsets[None, :] * stride_x_d
+            )
+            x_chunk = tl.load(
+                x_ptrs,
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+
+            c_ptrs = (
+                c_ptr
+                + pid_b * stride_c_b
+                + k_offsets[None, :] * stride_c_k
+                + d_offsets[:, None] * stride_c_d
+            )
+            c_chunk = tl.load(
+                c_ptrs,
+                mask=k_mask[None, :] & d_mask[:, None],
+                other=0.0,
+            )
+
+            cross += tl.dot(x_chunk, c_chunk).to(tl.float32)
+
+        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = tl.maximum(dist, 0.0)
+        dist = tl.where(k_mask[None, :], dist, 3.4e38)
+
+        curr_min = tl.min(dist, axis=1)
+        curr_idx = tl.argmin(dist, axis=1)
+
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+
+    out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
+
+_euclid_assign_kernel_split_d_autotuned = triton.autotune(
+    _TUNE_CONFIGS_SPLIT_D, key=["N", "K", "D"]
+)(_euclid_assign_kernel_split_d)
+
+
 @triton.jit
 def _cosine_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
@@ -627,6 +1064,102 @@ def _cosine_assign_kernel(
 _cosine_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_cosine_assign_kernel)
 
 
+# ===============================================================
+# Split-D Cosine assign kernel. Same loop structure as Euclid split-D
+# but tracks running argmax over the dot-product (cosine score with
+# normalized inputs).
+# ===============================================================
+@triton.jit
+def _cosine_assign_kernel_split_d(
+    x_ptr,
+    c_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    stride_x_b: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_k: tl.constexpr,
+    stride_c_d: tl.constexpr,
+    stride_out_b: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_b = pid_b.to(tl.int64)
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_offsets = n_offsets.to(tl.int64)
+    n_mask = n_offsets < N
+
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
+
+    best_dist = tl.full((BLOCK_N,), -3.4e38, tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_offsets = k_offsets.to(tl.int64)
+        k_mask = k_offsets < K
+
+        cross = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+
+        for d_start in range(0, D, BLOCK_D):
+            d_offsets = d_start + offs_d
+            d_mask = d_offsets < D
+
+            x_ptrs = (
+                x_ptr
+                + pid_b * stride_x_b
+                + n_offsets[:, None] * stride_x_n
+                + d_offsets[None, :] * stride_x_d
+            )
+            x_chunk = tl.load(
+                x_ptrs,
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+
+            c_ptrs = (
+                c_ptr
+                + pid_b * stride_c_b
+                + k_offsets[None, :] * stride_c_k
+                + d_offsets[:, None] * stride_c_d
+            )
+            c_chunk = tl.load(
+                c_ptrs,
+                mask=k_mask[None, :] & d_mask[:, None],
+                other=0.0,
+            )
+
+            cross += tl.dot(x_chunk, c_chunk).to(tl.float32)
+
+        # Mask invalid centroid columns to a sentinel below any real score.
+        dist = tl.where(k_mask[None, :], cross, -torch.finfo(torch.float32).max)
+
+        curr_max = tl.max(dist, axis=1)
+        curr_idx = tl.argmax(dist, axis=1)
+
+        update = curr_max > best_dist
+        best_dist = tl.where(update, curr_max, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+
+    out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
+
+_cosine_assign_kernel_split_d_autotuned = triton.autotune(
+    _TUNE_CONFIGS_SPLIT_D, key=["N", "K", "D"]
+)(_cosine_assign_kernel_split_d)
+
+
 # ---------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------
@@ -687,6 +1220,8 @@ def euclid_assign_triton(
 
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
 
+    use_split_d = _need_split_d(D, x.dtype, x.device)
+
     selected_config = None
     if config is not None:
         selected_config = config
@@ -699,10 +1234,54 @@ def euclid_assign_triton(
             "num_warps": num_warps,
             "num_stages": num_stages,
         }
+        if use_split_d and "BLOCK_D" not in selected_config:
+            # Caller supplied a small-D-shaped config but D demands split-D.
+            # Use a sane default for BLOCK_D and let SMEM fitter shrink.
+            selected_config = dict(selected_config)
+            selected_config["BLOCK_D"] = 64
+            selected_config = _fit_config_to_smem_split_d(
+                selected_config,
+                D,
+                _dtype_bytes(x.dtype),
+                _smem_limit(x.device),
+            )
     elif use_heuristic:
-        selected_config = _heuristic_euclid_config(
-            N, K, D, device=x.device, dtype=x.dtype
-        )
+        if use_split_d:
+            selected_config = _heuristic_euclid_config_split_d(
+                N, K, D, device=x.device, dtype=x.dtype
+            )
+        else:
+            selected_config = _heuristic_euclid_config(
+                N, K, D, device=x.device, dtype=x.dtype
+            )
+
+    if use_split_d:
+        if selected_config is None:
+            _euclid_assign_kernel_split_d_autotuned[grid](
+                x, centroids, x_sq, c_sq, out,
+                B, N, K, D,
+                stride_x_b, stride_x_n, stride_x_d,
+                stride_c_b, stride_c_k, stride_c_d,
+                stride_xsq_b, stride_xsq_n,
+                stride_csq_b, stride_csq_k,
+                stride_out_b, stride_out_n,
+            )
+        else:
+            _euclid_assign_kernel_split_d[grid](
+                x, centroids, x_sq, c_sq, out,
+                B, N, K, D,
+                stride_x_b, stride_x_n, stride_x_d,
+                stride_c_b, stride_c_k, stride_c_d,
+                stride_xsq_b, stride_xsq_n,
+                stride_csq_b, stride_csq_k,
+                stride_out_b, stride_out_n,
+                BLOCK_N=selected_config["BLOCK_N"],
+                BLOCK_K=selected_config["BLOCK_K"],
+                BLOCK_D=selected_config["BLOCK_D"],
+                num_warps=selected_config["num_warps"],
+                num_stages=selected_config["num_stages"],
+            )
+        return out
 
     if selected_config is not None:
         _euclid_assign_kernel[grid](
@@ -792,7 +1371,35 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
 
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
 
-    _cosine_assign_kernel_autotuned[grid](
+    if _need_split_d(D, x.dtype, x.device):
+        _cosine_assign_kernel_split_d_autotuned[grid](
+            x,
+            centroids,
+            out,
+            B,
+            N,
+            K,
+            D,
+            stride_x_b,
+            stride_x_n,
+            stride_x_d,
+            stride_c_b,
+            stride_c_k,
+            stride_c_d,
+            stride_out_b,
+            stride_out_n,
+        )
+        return out
+
+    # Small-D path. The existing autotune sweep includes configs that may
+    # not fit SMEM (e.g. fp16 D=512 BN=64 BK=64 S=4 → 320 KiB > H200 limit;
+    # fp32 D=512 BN=64 BK=32 S=4 → 393 KiB). The cosine kernel has the
+    # same tile shapes as euclid, so reuse the SMEM-aware euclid heuristic
+    # for config selection regardless of dtype. This keeps fp16/bf16 small-D
+    # behaviour byte-identical to the euclid path's heuristic (verified by
+    # examples/regression_fp16_smalld.py).
+    cfg = _heuristic_euclid_config(N, K, D, device=x.device, dtype=x.dtype)
+    _cosine_assign_kernel[grid](
         x,
         centroids,
         out,
@@ -808,6 +1415,10 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
         stride_c_d,
         stride_out_b,
         stride_out_n,
+        BLOCK_N=cfg["BLOCK_N"],
+        BLOCK_K=cfg["BLOCK_K"],
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
     )
     return out
 

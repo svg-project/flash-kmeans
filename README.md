@@ -61,6 +61,41 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ![benchmark large N](assets/benchmark_large.png)
 
+### Large-D and dtype support
+
+The Triton assign kernel ships in two flavours and dispatches between them
+automatically based on input shape and dtype:
+
+- **Small-D path** (existing kernel, `D ≤ 512`): one program loads `x_tile (BN, D)`
+  once and streams over centroids in `BLOCK_K` chunks. Per-arch heuristics
+  (H200, H100, A100, GB10) pick `(BLOCK_N, BLOCK_K, num_warps, num_stages)` based
+  on a hand-tuned table derived from `flash-kmeans-tune` grid sweeps.
+- **Split-D path** (new, `D > 512` or whenever the small-D kernel cannot fit
+  shared memory at minimum tile size): outer K loop, inner D loop tiled by
+  `BLOCK_D`. The cross accumulator `(BN, BK)` is held in registers across the
+  D loop, so the K-streaming property (no `(B, N, K)` distance matrix
+  materialised) is preserved.
+
+**Unknown GPUs**: when the GPU does not match any of the tuned families
+(H200/H100/A100/GB10), the wrapper unconditionally dispatches to the
+split-D kernel with a conservative fallback config (`BLOCK_N=32, BLOCK_K=32,
+BLOCK_D=32, num_warps=4, num_stages=1`). This avoids any reliance on
+per-arch tuning data we don't have, and the split-D path's
+`_fit_config_to_smem_split_d` post-process guarantees the launch fits
+shared memory regardless of the actual budget. Performance will be
+suboptimal on unfamiliar architectures — re-tune via
+[flash-kmeans-tune](https://github.com/svg-project/flash-kmeans-tune)
+to populate the corresponding `_heuristic_euclid_config_<arch>_largeD`
+function.
+
+The dispatch is automatic — no API changes:
+
+```python
+from flash_kmeans import FlashKMeans
+km = FlashKMeans(d=2048, k=1024, dtype=torch.float32)  # large-D + fp32 ok
+km.train(data)
+```
+
 ### Multi-GPU Support
 
 For large-N workloads (`kmeans_largeN`), flash-kmeans now supports automatic multi-GPU scaling. When `device=None`, all available GPUs are used automatically; specifying a single device (e.g. `device="cuda:0"`) falls back to single-GPU mode. No new API parameters are needed.
