@@ -581,8 +581,8 @@ def _heuristic_euclid_config(
 
 # -----------------------------------------------------------------------------
 # Split-D heuristic. Per-arch tables stay conservative for now and rely on
-# ``_fit_config_to_smem_split_d`` for SMEM safety. H200 has the only freshly
-# tuned table; H100/A100/GB10 use the same defaults until tuning data lands.
+# ``_fit_config_to_smem_split_d`` for SMEM safety. H200 and H100 have freshly
+# tuned tables; A100/GB10 still use a single default until tuning data lands.
 # -----------------------------------------------------------------------------
 
 
@@ -630,13 +630,57 @@ def _heuristic_euclid_config_h200_largeD(N: int, K: int, D: int, dtype) -> dict:
 
 
 def _heuristic_euclid_config_h100_largeD(N: int, K: int, D: int, dtype) -> dict:
-    return {
-        "BLOCK_N": 64,
-        "BLOCK_K": 64,
-        "BLOCK_D": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    }
+    """H100 split-D heuristic.
+
+    Derived from a focused grid sweep over D ∈ {1024, 2048, 4096},
+    K ∈ {256, 1024, 4096, 16384, 65536}, N ∈ {65536, 262144, 1048576},
+    B=1, fp16+fp32. Two cells (K=65536 D=4096 N=1048576 fp16/fp32) were
+    skipped due to multi-hour cost; their config is extrapolated from the
+    matching K=65536 K=16384/N=1048576 winners (same dominant shape).
+
+    Patterns:
+      - fp16/bf16: BN=128 BK=128 BD=64 W=8 S=4 dominates D=1024 (K≥1024)
+        and D=4096. D=2048 with K ∈ [1024, 16384] prefers BN=64 BK=128
+        BD=128 W=4 S=4 — a deeper D tile amortises centroid loads when
+        the centroid set is moderate; the wider N tile only pays off
+        once K=65536 makes per-program K-streaming dominate. K=256
+        uniformly prefers the smaller N tile (BN=64, W=4) — too few K
+        tiles to justify the wider N-axis program.
+      - fp32: BN=128 BK=128 BD=32 W=8 S=4 dominates D ≥ 2048. D=1024
+        prefers BN=64 BK=128 BD=64 W=4 S=4 across all K — distinct from
+        H200 which keeps BD=32 at small K, because H100's narrower L2
+        benefits from the wider D chunk amortising the centroid stream.
+    """
+    half = _is_half_dtype(dtype)
+
+    if half:
+        # K=256 has too few centroid tiles to justify a wide N program.
+        if K <= 256:
+            return {"BLOCK_N": 64, "BLOCK_K": 128, "BLOCK_D": 64,
+                    "num_warps": 4, "num_stages": 4}
+        if D >= 4096:
+            return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 64,
+                    "num_warps": 8, "num_stages": 4}
+        if D >= 2048:
+            # K ∈ [1024, 16384]: deeper D tile (BD=128) amortises centroid
+            # loads better. K=65536: the long K stream dominates and the
+            # wider N tile (BN=128, BD=64) wins.
+            if K <= 16384:
+                return {"BLOCK_N": 64, "BLOCK_K": 128, "BLOCK_D": 128,
+                        "num_warps": 4, "num_stages": 4}
+            return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 64,
+                    "num_warps": 8, "num_stages": 4}
+        # D ≈ 1024 (also covers D ∈ (512, 1024) when small-D doesn't fit).
+        return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 64,
+                "num_warps": 8, "num_stages": 4}
+
+    # fp32 / wider
+    if D >= 2048:
+        return {"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_D": 32,
+                "num_warps": 8, "num_stages": 4}
+    # D ≈ 1024 fp32 — wider BD=64 wins consistently across K on H100.
+    return {"BLOCK_N": 64, "BLOCK_K": 128, "BLOCK_D": 64,
+            "num_warps": 4, "num_stages": 4}
 
 
 def _heuristic_euclid_config_a100_largeD(N: int, K: int, D: int, dtype) -> dict:
