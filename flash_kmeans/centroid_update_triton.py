@@ -9,6 +9,21 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _next_pow2(v: int) -> int:
+    if v <= 1:
+        return 1
+    return 1 << (v - 1).bit_length()
+
+
+def _pad_d(D: int) -> int:
+    """Pad D up to the next power of two (min 16) for kernels that load the
+    whole feature dimension as a single tile. ``tl.arange`` requires a
+    power-of-two range, so non-power-of-two D (e.g. 192, 320, 768) needs to
+    be expanded and the tail masked out at load/store time.
+    """
+    return max(16, _next_pow2(D))
+
+
 @triton.jit
 def _centroid_update_kernel(
     x_ptr,                # *f16 / *f32 [B, N, D]
@@ -186,6 +201,7 @@ def _centroid_update_chunk_kernel(
     D: tl.constexpr,
     K: tl.constexpr,
     BLOCK_N: tl.constexpr,   # how many tokens (points) each program processes
+    D_PAD: tl.constexpr,     # next pow2 >= D (min 16); tail [D, D_PAD) is masked
 ):
     """Each program processes **BLOCK_N consecutive, already-sorted tokens**.
 
@@ -210,9 +226,11 @@ def _centroid_update_chunk_kernel(
     cid_batch_base     = sorted_cluster_ptr + b * stride_cluster_b
     x_batch_base       = x_ptr + b * stride_x_b  # for pointer arithmetic
 
-    # helper aranges
+    # helper aranges. ``offs_dim`` covers D_PAD lanes; ``d_mask`` zeros the
+    # padded tail so non-power-of-two D works without OOB loads/stores.
     offs_token = tl.arange(0, BLOCK_N).to(tl.int64)
-    offs_dim   = tl.arange(0, D).to(tl.int64)
+    offs_dim   = tl.arange(0, D_PAD).to(tl.int64)
+    d_mask     = offs_dim < D
 
     # first token index & validity mask
     token_idx  = chunk_start + offs_token
@@ -228,18 +246,20 @@ def _centroid_update_chunk_kernel(
     all_tokens_idxs = tl.load(idx_batch_base + token_idx * stride_idx_n, mask=valid_tok, other=-1) # [BLOCK_N]
     all_tokens_idxs = all_tokens_idxs.to(tl.int64)
 
-    load_mask = all_tokens_idxs[:,None] * D + offs_dim[None,:]
-
     for cid in range(first_id, last_id + 1):
         cluster_mask = all_ids == cid
         cluster_size = tl.sum(cluster_mask.to(tl.int32))
         if cluster_size != 0:
             row_ptrs = x_batch_base + all_tokens_idxs[:,None]*stride_x_n + offs_dim[None,:]*stride_x_d
-            cluster_feats = tl.load(row_ptrs, mask=cluster_mask[:,None], other=0.0) # [BLOCK_N, D]
+            cluster_feats = tl.load(
+                row_ptrs,
+                mask=cluster_mask[:,None] & d_mask[None,:],
+                other=0.0,
+            ) # [BLOCK_N, D_PAD]
             cluster_feats = cluster_feats.to(tl.float32)
             sum_feats = tl.sum(cluster_feats, axis=0)
             dest_ptr = sum_ptr + b*stride_sum_b + cid*stride_sum_k + offs_dim*stride_sum_d
-            tl.atomic_add(dest_ptr, sum_feats)
+            tl.atomic_add(dest_ptr, sum_feats, mask=d_mask)
             tl.atomic_add(count_ptr + b*stride_count_b + cid*stride_count_k, cluster_size)
 
 
@@ -281,6 +301,7 @@ def triton_centroid_update_sorted_cosine(x_norm: torch.Tensor, cluster_ids: torc
         centroid_cnts.stride(0), centroid_cnts.stride(1),
         B, N, D, K,
         BLOCK_N=BLOCK_N,
+        D_PAD=_pad_d(D),
     )
 
     # finalise – convert to means, handle empty clusters, renormalise
@@ -351,6 +372,7 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
         centroid_cnts.stride(0), centroid_cnts.stride(1),
         B, N, D, K,
         BLOCK_N=BLOCK_N,
+        D_PAD=_pad_d(D),
     )
 
     if calculate_new:

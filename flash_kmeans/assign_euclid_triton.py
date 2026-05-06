@@ -18,6 +18,23 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _next_pow2(v: int) -> int:
+    """Smallest power of two >= max(v, 1)."""
+    if v <= 1:
+        return 1
+    return 1 << (v - 1).bit_length()
+
+
+# Triton's `tl.arange` requires a power-of-two range, and `tl.dot` needs an
+# inner dim >= 16. The small-D kernels load the full feature dimension as a
+# single tile, so we pad D up to ``max(16, next_pow2(D))`` and mask the tail.
+# When the caller already passed a power-of-two D >= 16, ``_pad_d(D) == D`` and
+# the per-D mask is constant-true — the compiler folds it away, preserving the
+# byte-for-byte fp16 small-D regime.
+def _pad_d(D: int) -> int:
+    return max(16, _next_pow2(D))
+
+
 # -----------------------------------------------------------------------------
 # Auto-tuning setup – explore various tile sizes / warp counts
 # -----------------------------------------------------------------------------
@@ -116,14 +133,16 @@ def _smem_bytes(D: int, BN: int, BK: int, num_stages: int, dtype_bytes: int) -> 
     """Approximate dynamic shared-memory usage of `_euclid_assign_kernel`.
 
     The kernel materialises:
-    - one ``x_tile`` of shape (BN, D) outside the K loop, and
-    - ``num_stages`` copies of ``c_tile`` of shape (D, BK) for the software
+    - one ``x_tile`` of shape (BN, D_PAD) outside the K loop, and
+    - ``num_stages`` copies of ``c_tile`` of shape (D_PAD, BK) for the software
       pipelined K loop.
 
     Other buffers (x_sq, c_sq, masks, accumulators) are negligible compared
-    to these and are ignored.
+    to these and are ignored. ``D`` is rounded up to the next power of two
+    (min 16) because the kernel itself uses that padded size.
     """
-    return D * dtype_bytes * (BN + num_stages * BK)
+    D_pad = _pad_d(D)
+    return D_pad * dtype_bytes * (BN + num_stages * BK)
 
 
 def _smem_limit(device) -> int:
@@ -806,6 +825,7 @@ def _euclid_assign_kernel(
     stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    D_PAD: tl.constexpr,
 ):
     """Each program handles a tile of BLOCK_N points for a given batch element.
 
@@ -823,9 +843,13 @@ def _euclid_assign_kernel(
     n_mask = n_offsets < N
 
     # ------------------------------------------------------------------
-    # Load x tile  (BLOCK_N, D)
+    # Load x tile  (BLOCK_N, D_PAD). D_PAD is the next power of two >= D
+    # so `tl.arange` is legal even for awkward D (e.g. 192, 320, 768).
+    # The d-mask zeroes out the [D, D_PAD) tail so the dot product treats
+    # padded lanes as 0 — equivalent to the unpadded computation.
     # ------------------------------------------------------------------
-    offs_d = tl.arange(0, D).to(tl.int64)
+    offs_d = tl.arange(0, D_PAD).to(tl.int64)
+    d_mask = offs_d < D
     # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
     x_ptrs = (
         x_ptr
@@ -833,7 +857,7 @@ def _euclid_assign_kernel(
         + n_offsets[:, None] * stride_x_n
         + offs_d[None, :] * stride_x_d
     )
-    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
     x_tile = x_tile  # compute in f32
 
     # Pre-load x_sq for the tile  (BLOCK_N,)
@@ -852,14 +876,14 @@ def _euclid_assign_kernel(
         k_offsets = k_offsets.to(tl.int64)
         k_mask = k_offsets < K
 
-        # Load centroid tile  (D, BLOCK_K)
+        # Load centroid tile  (D_PAD, BLOCK_K)
         c_ptrs = (
             c_ptr
             + pid_b * stride_c_b
             + k_offsets[None, :] * stride_c_k
             + offs_d[:, None] * stride_c_d
         )
-        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :] & d_mask[:, None], other=0.0)
         c_tile = c_tile
 
         # load c_sq for the tile  (BLOCK_K,)
@@ -1030,6 +1054,7 @@ def _cosine_assign_kernel(
     stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    D_PAD: tl.constexpr,
 ):
     """Each program handles a tile of BLOCK_N points for a given batch element.
 
@@ -1047,9 +1072,11 @@ def _cosine_assign_kernel(
     n_mask = n_offsets < N
 
     # ------------------------------------------------------------------
-    # Load x tile  (BLOCK_N, D)
+    # Load x tile  (BLOCK_N, D_PAD). See _euclid_assign_kernel for the
+    # rationale behind the D_PAD padding.
     # ------------------------------------------------------------------
-    offs_d = tl.arange(0, D).to(tl.int64)
+    offs_d = tl.arange(0, D_PAD).to(tl.int64)
+    d_mask = offs_d < D
     # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
     x_ptrs = (
         x_ptr
@@ -1057,11 +1084,11 @@ def _cosine_assign_kernel(
         + n_offsets[:, None] * stride_x_n
         + offs_d[None, :] * stride_x_d
     )
-    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
     x_tile = x_tile  # compute in f32
 
     # Init best distance / index
-    best_dist = tl.full((BLOCK_N,), -3.4e38, tl.float32)  # less is worse 
+    best_dist = tl.full((BLOCK_N,), -3.4e38, tl.float32)  # less is worse
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
     # ------------------------------------------------------------------
@@ -1072,14 +1099,14 @@ def _cosine_assign_kernel(
         k_offsets = k_offsets.to(tl.int64)
         k_mask = k_offsets < K
 
-        # Load centroid tile  (D, BLOCK_K)
+        # Load centroid tile  (D_PAD, BLOCK_K)
         c_ptrs = (
             c_ptr
             + pid_b * stride_c_b
             + k_offsets[None, :] * stride_c_k
             + offs_d[:, None] * stride_c_d
         )
-        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :] & d_mask[:, None], other=0.0)
         c_tile = c_tile
 
         # Compute cosine distance (BLOCK_N, BLOCK_K) = x_tile @ c_tile
@@ -1327,6 +1354,7 @@ def euclid_assign_triton(
             )
         return out
 
+    D_pad = _pad_d(D)
     if selected_config is not None:
         _euclid_assign_kernel[grid](
             x,
@@ -1352,6 +1380,7 @@ def euclid_assign_triton(
             stride_out_n,
             BLOCK_N=selected_config["BLOCK_N"],
             BLOCK_K=selected_config["BLOCK_K"],
+            D_PAD=D_pad,
             num_warps=selected_config["num_warps"],
             num_stages=selected_config["num_stages"],
         )
@@ -1378,6 +1407,7 @@ def euclid_assign_triton(
             stride_csq_k,
             stride_out_b,
             stride_out_n,
+            D_PAD=D_pad,
         )
     return out
 
@@ -1461,6 +1491,7 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
         stride_out_n,
         BLOCK_N=cfg["BLOCK_N"],
         BLOCK_K=cfg["BLOCK_K"],
+        D_PAD=_pad_d(D),
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
     )
