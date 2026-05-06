@@ -13,7 +13,6 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/home/ec2-user/flash-kmeans")
 
 from flash_kmeans.assign_euclid_triton import (
     cosine_assign_triton,
