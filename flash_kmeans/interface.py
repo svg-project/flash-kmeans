@@ -237,7 +237,12 @@ class FlashKMeans:
         compute_dtype = self.dtype or x_b.dtype 
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
  
-        x_sq = (x_b ** 2).sum(dim=-1)
+        # Chunked to avoid materializing a full (B, N, D) temp.
+        N_ = x_b.shape[1]
+        x_sq = torch.empty(x_b.shape[:-1], device=x_b.device, dtype=x_b.dtype)
+        _CHUNK = 1 << 20
+        for i in range(0, N_, _CHUNK):
+            x_sq[:, i:i + _CHUNK] = (x_b[:, i:i + _CHUNK] ** 2).sum(dim=-1)
 
         if self.use_triton:
             # Call Triton assignment kernel
