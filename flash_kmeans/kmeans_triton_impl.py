@@ -78,8 +78,13 @@ def batch_kmeans_Euclid(
     """
     B, N, D = x.shape
 
-    # Pre-compute squared L2 norm of all points (constant during iterations)
-    x_sq = (x ** 2).sum(dim=-1)  # (B, N)
+    # Pre-compute squared L2 norm of all points (constant during iterations).
+    # Done in chunks to avoid materializing a full (B, N, D) `x ** 2` temp,
+    # which would otherwise double the peak GPU memory of the dataset.
+    x_sq = torch.empty((B, N), device=x.device, dtype=x.dtype)
+    XSQ_CHUNK = 1 << 20  # 1M rows per chunk
+    for i in range(0, N, XSQ_CHUNK):
+        x_sq[:, i:i + XSQ_CHUNK] = (x[:, i:i + XSQ_CHUNK] ** 2).sum(dim=-1)
 
     if init_centroids is None:
         # Randomly select initial centers from x
