@@ -9,6 +9,8 @@ try:
     from .centroid_update_triton import (
         triton_centroid_update_euclid,
         triton_centroid_update_sorted_euclid,
+        triton_centroid_finalize,
+        triton_lloyd_centroid_step_euclid,
     )
     from .kmeans_large import kmeans_largeN, kmeans_largeN_assign
 except Exception:
@@ -28,6 +30,8 @@ except Exception:
 
     triton_centroid_update_euclid = no_torch_fallback
     triton_centroid_update_sorted_euclid = no_torch_fallback
+    triton_centroid_finalize = no_torch_fallback
+    triton_lloyd_centroid_step_euclid = no_torch_fallback
     batch_kmeans_Euclid = batch_kmeans_Euclid_torch_native
     batch_kmeans_Cosine = no_torch_fallback
     batch_kmeans_Dot = no_torch_fallback
@@ -40,6 +44,8 @@ __all__ = [
     "batch_kmeans_Dot",
     "triton_centroid_update_euclid",
     "triton_centroid_update_sorted_euclid",
+    "triton_centroid_finalize",
+    "triton_lloyd_centroid_step_euclid",
     "FlashKMeans",
     "kmeans_largeN",
     "kmeans_largeN_assign",

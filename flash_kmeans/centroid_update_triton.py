@@ -365,6 +365,175 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
 # ------------------------------ END new implementation ------------------------------
 
 
+# =============================================================================
+# R3: Fused centroid finalize + per-iter Lloyd helper
+# =============================================================================
+#
+# `_centroid_finalize_kernel` collapses 6 host-side ops into one Triton kernel:
+#     1. cnts.float()             count cast f32
+#     2. clamp(cnts, min=1)       safe-divide guard
+#     3. sums / cnts              per-element divide
+#     4. empty-mask where         fall back to old centroid where cnts==0
+#     5. cast back to original dtype
+#     6. (new - old).norm(dim=-1) per-cluster shift (host then takes max)
+#
+# Outputs (B, K) per-cluster shift so the host max reduction is over K, not B*K*D.
+#
+# `triton_lloyd_centroid_step_euclid` glues sort + chunk-update + finalize using
+# preallocated sums / cnts / new / shift buffers reused across Lloyd iterations,
+# so per-iter allocation cost is zero.
+
+@triton.jit
+def _centroid_finalize_kernel(
+    sums_ptr,           # *f32  [B, K, D]
+    cnts_ptr,           # *i32  [B, K]
+    old_ptr,            # *T    [B, K, D]   (T = output dtype)
+    new_ptr,            # *T    [B, K, D]   (output)
+    shift_ptr,          # *f32  [B, K]      (output: per-cluster ‖new − old‖₂)
+    stride_sums_b, stride_sums_k, stride_sums_d,
+    stride_cnts_b, stride_cnts_k,
+    stride_old_b, stride_old_k, stride_old_d,
+    stride_new_b, stride_new_k, stride_new_d,
+    stride_shift_b, stride_shift_k,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    cnt = tl.load(cnts_ptr + pid_b * stride_cnts_b + pid_k * stride_cnts_k).to(tl.float32)
+    inv = 1.0 / tl.maximum(cnt, 1.0)
+    is_empty = cnt == 0.0
+
+    sq_acc = tl.zeros([], dtype=tl.float32)
+    offs_d = tl.arange(0, BLOCK_D)
+    n_blocks = (D + BLOCK_D - 1) // BLOCK_D
+
+    for blk in range(n_blocks):
+        d_idx = blk * BLOCK_D + offs_d
+        d_mask = d_idx < D
+
+        sum_off = pid_b * stride_sums_b + pid_k * stride_sums_k + d_idx * stride_sums_d
+        old_off = pid_b * stride_old_b + pid_k * stride_old_k + d_idx * stride_old_d
+        new_off = pid_b * stride_new_b + pid_k * stride_new_k + d_idx * stride_new_d
+
+        s = tl.load(sums_ptr + sum_off, mask=d_mask, other=0.0).to(tl.float32)
+        old_v = tl.load(old_ptr + old_off, mask=d_mask, other=0.0).to(tl.float32)
+
+        # divide; if empty, fall back to old centroid (shift contribution = 0)
+        new_v = tl.where(is_empty, old_v, s * inv)
+
+        # accumulate squared shift
+        diff = new_v - old_v
+        sq_acc += tl.sum(tl.where(d_mask, diff * diff, 0.0))
+
+        tl.store(new_ptr + new_off, new_v, mask=d_mask)
+
+    shift = tl.sqrt(sq_acc)
+    tl.store(shift_ptr + pid_b * stride_shift_b + pid_k * stride_shift_k, shift)
+
+
+def triton_centroid_finalize(
+    sums: torch.Tensor,        # (B, K, D) fp32
+    cnts: torch.Tensor,        # (B, K) int32
+    old_centroids: torch.Tensor,  # (B, K, D) original dtype
+    *,
+    out: torch.Tensor = None,
+    shift: torch.Tensor = None,
+    BLOCK_D: int = 128,
+):
+    """Fused finalize: sums/cnts → new centroids + per-cluster shifts.
+
+    Replaces the host pipeline:
+        cnts_f = cnts.float().unsqueeze(-1).clamp(min=1)
+        new = sums / cnts_f
+        new = where(cnts==0, old, new)
+        new = new.to(old.dtype)
+        shift = (new - old).norm(dim=-1)        # (B, K)
+
+    Returns (new_centroids, shift) where shift has shape (B, K) — caller takes
+    `.max()` over the K axis for the convergence criterion.
+    """
+    assert sums.is_cuda and cnts.is_cuda and old_centroids.is_cuda
+    B, K, D = sums.shape
+    assert cnts.shape == (B, K)
+    assert old_centroids.shape == (B, K, D)
+
+    if out is None:
+        out = torch.empty_like(old_centroids)
+    if shift is None:
+        shift = torch.empty((B, K), device=sums.device, dtype=torch.float32)
+
+    grid = (B, K)
+    _centroid_finalize_kernel[grid](
+        sums, cnts, old_centroids, out, shift,
+        sums.stride(0), sums.stride(1), sums.stride(2),
+        cnts.stride(0), cnts.stride(1),
+        old_centroids.stride(0), old_centroids.stride(1), old_centroids.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        shift.stride(0), shift.stride(1),
+        K=K, D=D, BLOCK_D=BLOCK_D,
+    )
+    return out, shift
+
+
+def triton_lloyd_centroid_step_euclid(
+    x: torch.Tensor,
+    cluster_ids: torch.Tensor,
+    old_centroids: torch.Tensor,
+    *,
+    BLOCK_N: int = 256,
+    sums_buf: torch.Tensor = None,
+    cnts_buf: torch.Tensor = None,
+    new_buf: torch.Tensor = None,
+    shift_buf: torch.Tensor = None,
+):
+    """Single Lloyd centroid step: sort → chunk-update → fused finalize.
+
+    All accumulator + output buffers can be preallocated and reused across
+    iterations for zero per-iter allocation cost.
+
+    Returns
+    -------
+    new_centroids : (B, K, D), original dtype  (== `new_buf` if provided)
+    cluster_ids   : (B, N) int (echoed back; unchanged)
+    max_shift     : scalar fp32 GPU tensor — `(new - old).norm(-1).max()`
+                    Caller can `.item()` to get host-side scalar.
+    """
+    B, N, D = x.shape
+    K = old_centroids.shape[1]
+
+    if sums_buf is None:
+        sums_buf = torch.zeros((B, K, D), device=x.device, dtype=torch.float32)
+    else:
+        sums_buf.zero_()
+    if cnts_buf is None:
+        cnts_buf = torch.zeros((B, K), device=x.device, dtype=torch.int32)
+    else:
+        cnts_buf.zero_()
+
+    # Reuse the existing sorted-update kernel to fill sums_buf / cnts_buf (no
+    # final divide — we delegate that to the fused finalize below).
+    triton_centroid_update_sorted_euclid(
+        x, cluster_ids, old_centroids,
+        BLOCK_N=BLOCK_N,
+        centroid_sums=sums_buf,
+        centroid_cnts=cnts_buf,
+        calculate_new=False,
+    )
+
+    new_centroids, shift_per_k = triton_centroid_finalize(
+        sums_buf, cnts_buf, old_centroids,
+        out=new_buf,
+        shift=shift_buf,
+    )
+    # max over K → (B,), then max over B → scalar (matches existing
+    # `(cnew - cold).norm(dim=-1).max()` semantics)
+    max_shift = shift_per_k.amax(dim=-1).amax()
+    return new_centroids, cluster_ids, max_shift
+
+
 def main():
     torch.manual_seed(0)
 

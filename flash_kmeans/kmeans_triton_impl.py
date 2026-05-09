@@ -2,7 +2,13 @@ import torch
 import torch.nn.functional as F
 from torch.cuda import nvtx
 from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton
-from flash_kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid, triton_centroid_update_sorted_cosine
+from flash_kmeans.centroid_update_triton import (
+    triton_centroid_update_cosine,
+    triton_centroid_update_euclid,
+    triton_centroid_update_sorted_euclid,
+    triton_centroid_update_sorted_cosine,
+    triton_lloyd_centroid_step_euclid,
+)
 from tqdm import trange
 
 # -------------------- Compiled single-iteration kernels --------------------
@@ -61,6 +67,7 @@ def batch_kmeans_Euclid(
     verbose=False,
     *,
     use_heuristic=True,
+    fused=True,
 ):
     """
     Batched KMeans clustering in PyTorch using Euclidean distance.
@@ -72,42 +79,75 @@ def batch_kmeans_Euclid(
         tol: Relative tolerance for center movement.
         verbose: Print loss for each iter.
         use_heuristic: Use heuristic Triton config (skip autotune).
+        fused: If True (default), use the R3 fused Lloyd path with preallocated
+               sums/cnts/new/shift buffers and ping-pong centroid swap (no
+               .clone() per iter). Falls back to legacy per-iter alloc when False.
     Returns:
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
     B, N, D = x.shape
+    K = n_clusters
 
     # Pre-compute squared L2 norm of all points (constant during iterations)
     x_sq = (x ** 2).sum(dim=-1)  # (B, N)
 
     if init_centroids is None:
         # Randomly select initial centers from x
-        indices = torch.randint(0, N, (B, n_clusters), device=x.device)
+        indices = torch.randint(0, N, (B, K), device=x.device)
         centroids = torch.gather(
             x,
             dim=1,
             index=indices[..., None].expand(-1, -1, D)
-        )  # (B, n_clusters, D)
+        )  # (B, K, D)
     else:
         centroids = init_centroids
 
-    centroids = centroids.view(B, n_clusters, D)
+    centroids = centroids.view(B, K, D).contiguous()
 
+    if not fused:
+        # ----- legacy path: per-iter alloc + .clone() -----
+        for it in range(max_iters):
+            centroids_new, center_shift, cluster_ids = _euclid_iter_compiled(
+                x, x_sq, centroids, use_heuristic
+            )
+            if verbose:
+                print(f"Iter {it}, center shift: {center_shift.item():.6f}")
+            if center_shift < tol:
+                break
+            centroids = centroids_new.clone()
+        return cluster_ids, centroids, it + 1
+
+    # ----- R3 fused path: preallocated buffers + ping-pong centroid swap -----
+    # Two centroid buffers swapped each iter so we never .clone().
+    cent_a = centroids
+    cent_b = torch.empty_like(centroids)
+
+    sums_buf = torch.zeros((B, K, D), device=x.device, dtype=torch.float32)
+    cnts_buf = torch.zeros((B, K), device=x.device, dtype=torch.int32)
+    shift_buf = torch.empty((B, K), device=x.device, dtype=torch.float32)
+
+    cur, nxt = cent_a, cent_b
+    cluster_ids = None
+    it = 0
     for it in range(max_iters):
-        # ---- compiled single iteration ----
-        centroids_new, center_shift, cluster_ids = _euclid_iter_compiled(
-            x, x_sq, centroids, use_heuristic
+        cluster_ids = euclid_assign_triton(x, cur, x_sq, use_heuristic=use_heuristic)
+        # writes new centroids into `nxt`, returns scalar GPU tensor for shift
+        new_cent, _, max_shift = triton_lloyd_centroid_step_euclid(
+            x, cluster_ids, cur,
+            sums_buf=sums_buf,
+            cnts_buf=cnts_buf,
+            new_buf=nxt,
+            shift_buf=shift_buf,
         )
-
-        # 4. Check for convergence
         if verbose:
-            print(f"Iter {it}, center shift: {center_shift.item():.6f}")
-        if center_shift < tol:
+            print(f"Iter {it}, center shift: {max_shift.item():.6f}")
+        # swap before convergence check so `cur` always points to the latest
+        cur, nxt = nxt, cur
+        if max_shift < tol:
             break
-        centroids = centroids_new.clone()
 
-    return cluster_ids, centroids, it + 1
+    return cluster_ids, cur, it + 1
 
 
 def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
