@@ -91,9 +91,7 @@ def main():
             B, N, K = 1, 8193, 1031
             x = torch.randn(B, N, D, device=device, dtype=dtype)
             c = torch.randn(B, K, D, device=device, dtype=dtype)
-            x_sq = (x.float() ** 2).sum(-1)
-
-            ids = euclid_assign_triton(x, c, x_sq)
+            ids = euclid_assign_triton(x, c)
             split = _need_split_d(D, dtype, x.device)
             label = f"euclid {str(dtype).replace('torch.', ''):>9} D={D:>4} split_d={split}"
             ref_dist = _euclid_ref(x, c)

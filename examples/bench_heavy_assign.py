@@ -59,7 +59,7 @@ def _hbm_bytes_for_assign(N: int, D: int, K: int, dtype_bytes: int) -> float:
     each output id written once.
 
     Lower-bound (assumes K*D fits in L2 so centroids are read once per
-    SM run, not per CTA): N*D*dtype + K*D*dtype + 2*N*4 (x_sq+out).
+    SM run, not per CTA): N*D*dtype + K*D*dtype + N*4 (out).
     Upper-bound (no L2 caching, every CTA re-reads C): same X read +
     (N/BM)*K*D*dtype centroids.
 
@@ -67,7 +67,7 @@ def _hbm_bytes_for_assign(N: int, D: int, K: int, dtype_bytes: int) -> float:
     centroids fully fit in L2, which is the typical regime for
     flash-kmeans (K*D up to a few MB).
     """
-    return N * D * dtype_bytes + K * D * dtype_bytes + N * 4 * 2
+    return N * D * dtype_bytes + K * D * dtype_bytes + N * 4
 
 
 def _allocate(N: int, D: int, K: int, dtype: torch.dtype, seed: int = 0):
@@ -75,21 +75,20 @@ def _allocate(N: int, D: int, K: int, dtype: torch.dtype, seed: int = 0):
     g.manual_seed(seed)
     x = torch.randn(1, N, D, device="cuda", dtype=dtype, generator=g)
     cents = torch.randn(1, K, D, device="cuda", dtype=dtype, generator=g)
-    x_sq = (x.float() ** 2).sum(-1)
     c_sq = (cents.float() ** 2).sum(-1).view(K).contiguous()
     out = torch.empty((1, N), device="cuda", dtype=torch.int32)
-    return x, cents, x_sq, c_sq, out
+    return x, cents, c_sq, out
 
 
 def _try_cute_tile(
     cute_tile: Optional[tuple],
-    x, cents, x_sq, c_sq, out,
+    x, cents, c_sq, out,
     repeats: int,
 ):
     from flash_kmeans.cutedsl_impl import cutedsl_assign_euclid
 
     def fn():
-        cutedsl_assign_euclid(x, cents, x_sq, out=out, c_sq=c_sq, cute_tile=cute_tile)
+        cutedsl_assign_euclid(x, cents, out=out, c_sq=c_sq, cute_tile=cute_tile)
 
     # Sanity: warmup also surfaces compile / SMEM errors as exceptions.
     try:
@@ -104,7 +103,7 @@ def run_one(
     cute_tiles: list,
 ):
     print(f"\n=== N={N:,} D={D} K={K:,} dtype={str(dtype).split('.')[-1]} ===")
-    x, cents, x_sq, c_sq, out = _allocate(N, D, K, dtype)
+    x, cents, c_sq, out = _allocate(N, D, K, dtype)
     flops = _flops_for_assign(N, D, K)
     hbm_lo = _hbm_bytes_for_assign(N, D, K, dtype_bytes)
 
@@ -114,7 +113,7 @@ def run_one(
     # ---- Triton ----------------------------------------------------------
     from flash_kmeans.assign_euclid_triton import euclid_assign_triton
     t_tri_us = _bench_us(
-        lambda: euclid_assign_triton(x, cents, x_sq, out=out, c_sq=c_sq.view(1, K)),
+        lambda: euclid_assign_triton(x, cents, out=out, c_sq=c_sq.view(1, K)),
         repeats=repeats,
     )
     tri_tflops = flops / (t_tri_us * 1e-6) / 1e12
@@ -126,9 +125,9 @@ def run_one(
     # ---- CuteDSL: heuristic + explicit tile sweep ----------------------------
     # heuristic
     from flash_kmeans.cutedsl_impl import cutedsl_assign_euclid
-    cutedsl_assign_euclid(x, cents, x_sq, out=out, c_sq=c_sq)  # warm
+    cutedsl_assign_euclid(x, cents, out=out, c_sq=c_sq)  # warm
     t_cute_h_us = _bench_us(
-        lambda: cutedsl_assign_euclid(x, cents, x_sq, out=out, c_sq=c_sq),
+        lambda: cutedsl_assign_euclid(x, cents, out=out, c_sq=c_sq),
         repeats=repeats,
     )
     h_tflops = flops / (t_cute_h_us * 1e-6) / 1e12
@@ -140,7 +139,7 @@ def run_one(
 
     # explicit tile sweep
     for bm, bn in cute_tiles:
-        t_us, err = _try_cute_tile((bm, bn), x, cents, x_sq, c_sq, out, repeats)
+        t_us, err = _try_cute_tile((bm, bn), x, cents, c_sq, out, repeats)
         if t_us is None:
             print(f"  CuteDSL (BM={bm},BN={bn:>3}):           SKIP   ({err.splitlines()[0]})")
             continue
@@ -151,7 +150,7 @@ def run_one(
               f"{c_bw:>4.2f} TB/s ({c_bw/HBM_PEAK_TBPS*100:>4.1f}% HBM) | "
               f"{t_tri_us/t_us:>4.2f}x vs Triton")
 
-    del x, cents, x_sq, c_sq, out
+    del x, cents, c_sq, out
     gc.collect()
     torch.cuda.empty_cache()
 

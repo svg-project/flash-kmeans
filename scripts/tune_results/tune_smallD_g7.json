@@ -1,0 +1,210 @@
+[
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 64,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 199.7056007385254
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 64,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 2560.6815338134766
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 64,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "time_us": 41730.206298828125
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 64,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 135116.93115234375
+  },
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 128,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 398.63200187683105
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 128,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 4726.055908203125
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 128,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 85913.81225585938
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 128,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 247631.5185546875
+  },
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 256,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 848.0256080627441
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 256,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 10176.435089111328
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 256,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 198218.15185546875
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 256,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 615227.34375
+  },
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 512,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 32,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 2404.7231674194336
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 512,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 32,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 31329.013061523438
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 512,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 32,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 720339.74609375
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 512,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 32,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 2197482.03125
+  }
+]

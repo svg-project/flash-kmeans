@@ -1,7 +1,7 @@
 """CuteDSL implementation of flash-kmeans (Hopper SM90).
 
 Public API:
-    cutedsl_assign_euclid(x, centroids, x_sq, out=None, c_sq=None, ...,
+    cutedsl_assign_euclid(x, centroids, out=None, c_sq=None, ...,
                           autotune=True, cute_tile=None)
     cutedsl_kmeans_Euclid(x, n_clusters, ...)
     cutedsl_finalize(...)
@@ -50,10 +50,11 @@ Triton kernel, but adds:
   pipeline through ``cutlass.pipeline.PipelineTmaAsync``.
 * In-register fused epilogue per centroid tile: the WGMMA accumulator
   ``(BM, BN_centroid)`` is converted to fp32 in registers, the
-  Euclidean distance ``x_sq + c_sq − 2·cross`` is computed in registers,
-  and a per-row running argmin is updated in registers. Across all
-  centroid tiles, only ``(BM,)`` int32 best-indices are written to GMEM
-  per CTA.
+  shifted Euclidean distance ``c_sq − 2·cross`` is computed in
+  registers (the ``||x||²`` term is constant per row and dropped — see
+  ``_cutedsl_assign_kernel.py``), and a per-row running argmin is
+  updated in registers. Across all centroid tiles, only ``(BM,)``
+  int32 best-indices are written to GMEM per CTA.
 * Optional **producer/consumer warp specialization** (FMHA pattern):
   one load WG (24 regs/thread) issues all TMAs while the consumer WGs
   (240 regs/thread, set via ``setmaxregister_decrease/increase``) run
@@ -115,7 +116,7 @@ Constraints
 
 The new fused kernel handles:
 * B = 1 (B > 1 falls back to ``euclid_assign_triton``).
-* fp16 / bf16 input and centroid dtype (matched), fp32 ``x_sq``/``c_sq``.
+* fp16 / bf16 input and centroid dtype (matched), fp32 ``c_sq``.
 * D a multiple of 16 (WGMMA K-tile is 16 for fp16/bf16).
 * SMEM-fits configs: roughly D × (BM + 2·BN) ≤ 224 KiB on H200.
   D > ~512 with the largest (BM, BN) tile may not fit; we shrink the
@@ -230,23 +231,29 @@ def _pick_tile(
 ) -> Tuple[int, int]:
     """Pick (BM, BN) tile shapes for the fused assign kernel.
 
-    Validated on H200 across small (K=8…1024) and heavy (K≈20K) shapes.
-    The table is intentionally small — auto-tuning across many configs
-    is expensive in CuteDSL JIT compile time (~1s/config), so a static
-    heuristic is a better trade-off than per-call autotuning. To force
-    a config, use the ``cute_tile`` arg of ``cutedsl_assign_euclid``.
+    Validated on H200 across the no-xsq kernel via
+    ``scripts/tune_cutedsl_h200.py`` (D ∈ {64, 128, 256, 512},
+    K ∈ {256, 4096, 65536}, N ∈ {65536, 1048576}, bf16+fp16). Each
+    branch is annotated with the cells that voted for it.
 
-    Empirical pattern (bf16, H200):
+    Use_ws (warp-specialised producer/consumer split) is *not* returned
+    here — the public API's autotune path picks it dynamically; the
+    static fallback (this function) always uses the non-WS variant.
 
-    * Heavy K (K ≥ 4096) is *compute-bound*: WGMMA is the bottleneck,
-      bigger BN amortises mainloop bookkeeping over more centroids per
-      tile. ``BN=256`` wins by 13–18 % over ``BN=128`` at D=128/256.
-      ``BN=64`` is competitive at D=64 (the WGMMA is short) and forced
-      at D=512 (SMEM budget).
-    * Mid K (128 < K < 4096): heuristic table tuned in the original
-      bench sweep. ``BN=128`` is the sweet spot.
-    * Small K (K ≤ 128): only a couple of tiles per CTA — narrower BN
-      avoids wasted compute on masked OOB columns.
+    Empirical pattern (no-xsq kernel, H200):
+
+    * D ≤ 64                          : BM=128 BN=64 (all cells)
+    * D = 128, K ≤ 256                : BM=128 BN=64
+    * D = 128, K ≥ 4K                 : BM=128 BN=256 (BN=256 wins big —
+        amortises mainloop + epilogue across more centroids per tile)
+    * D = 256, K ≤ 256                : BM=128 BN=128
+    * D = 256, K ≥ 4K                 : BM=128 BN=128 (autotune flips
+        on WS here for an extra ~10 %; the static path skips WS)
+    * D = 512 (and 320..511)          : BM=128 BN=64 (BN=256 won't fit
+        H200's 226 KiB SMEM budget at this D)
+
+    Tile candidates are tried in winner-first order; if a tile fails to
+    fit SMEM the next candidate is tried.
     """
     smem_capacity = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
     bytes_per = 2  # fp16/bf16
@@ -254,36 +261,36 @@ def _pick_tile(
     is_heavy_k = K >= 4096
 
     if D >= 384:
-        # Very wide D: BN=256 won't fit. (128, 64) is the largest
-        # universally-fitting config; (64, ...) is the next fallback.
-        candidates = [(128, 64), (64, 128), (64, 64)]
+        # D ≥ ~512. BN=256 won't fit; BN=128 is the SMEM ceiling and
+        # the autotune picks BN=64 over it. Order winner-first.
+        candidates = [(128, 64), (128, 128), (64, 128), (64, 64)]
     elif D >= 192:
         # D ≈ 256.
         if is_heavy_k:
-            candidates = [(128, 256), (128, 128), (128, 64), (64, 128), (64, 64)]
+            # K ≥ 4K: BN=128 wins; BN=256 falls slightly behind because
+            # the in-register epilogue cost grows faster than the WGMMA
+            # work in this regime.
+            candidates = [(128, 128), (128, 256), (128, 64), (64, 128), (64, 64)]
         else:
+            # K ≤ 256: only 2-4 centroid tiles per CTA — wide BN is
+            # wasted on masked OOB columns.
             candidates = [(128, 128), (128, 64), (64, 128), (64, 64)]
     elif D >= 96:
-        # D = 128.
+        # D ≈ 128. BN=256 is the runaway winner once K ≥ 4K.
         if is_heavy_k:
             candidates = [(128, 256), (128, 128), (128, 64), (64, 128), (64, 64)]
-        elif K <= 128:
-            candidates = [(128, 64), (128, 128), (64, 64)]
         else:
-            candidates = [(128, 128), (128, 64), (64, 128), (64, 64)]
+            # K ≤ 256: small-K, narrow BN avoids masked-column waste.
+            candidates = [(128, 64), (128, 128), (64, 128), (64, 64)]
     elif D >= 33:
-        # D = 64. Heavy-K (K=20K bench): BN=64 = 252 TFLOPs >
-        # BN=256 = 248 > BN=128 = 231 TFLOPs. The WGMMA at D=64 is
-        # short (4 inner k-blocks) so BN=64 keeps mainloop tight and
-        # avoids the per-tile epilogue scaling with BN.
-        if is_heavy_k:
-            candidates = [(128, 64), (128, 256), (128, 128), (64, 64)]
-        elif K <= 64:
-            candidates = [(128, 64), (128, 128), (64, 64)]
-        else:
-            candidates = [(128, 128), (128, 64)]
+        # D ≈ 64. BN=64 wins everywhere on the no-xsq kernel — the
+        # WGMMA at D=64 is so short (single k-block per WGMMA op) that
+        # any wider BN inflates the epilogue without speeding up the
+        # mainloop.
+        candidates = [(128, 64), (128, 128), (128, 256), (64, 64)]
     else:
-        # D ≤ 32. Tiny problem; tile choice barely matters.
+        # D ≤ 32. Tiny problem; the launcher already routes these to
+        # Triton for D ≤ 16 & K ≤ 16, so this branch only sees D∈[17,32].
         if K <= 8:
             candidates = [(128, 64), (128, 128), (64, 64)]
         else:
@@ -292,7 +299,6 @@ def _pick_tile(
     for BM, BN in candidates:
         if _smem_fits(BM, BN, D, bytes_per, smem_capacity):
             return BM, BN
-    # Should be unreachable at D <= 512 but leave a defensive fallback.
     return 64, 64
 
 
@@ -324,7 +330,6 @@ def _cached_from_dlpack(t: torch.Tensor):
 def _get_compiled_assign(
     x: torch.Tensor,
     centroids: torch.Tensor,
-    x_sq: torch.Tensor,
     c_sq: torch.Tensor,
     out: torch.Tensor,
     BM: int,
@@ -358,7 +363,7 @@ def _get_compiled_assign(
     compiled = cute_mod.compile(
         kernel,
         from_dlpack(x), from_dlpack(centroids),
-        from_dlpack(x_sq), from_dlpack(c_sq), from_dlpack(out),
+        from_dlpack(c_sq), from_dlpack(out),
         stream,
     )
     _kernel_cache[key] = (compiled, stream)
@@ -368,7 +373,6 @@ def _get_compiled_assign(
 def _autotune_pick(
     x2d: torch.Tensor,
     c2d: torch.Tensor,
-    x_sq_1d: torch.Tensor,
     c_sq: torch.Tensor,
     out_1d: torch.Tensor,
     *,
@@ -399,7 +403,7 @@ def _autotune_pick(
     for BM, BN, use_ws in candidates:
         try:
             compiled, stream = _get_compiled_assign(
-                x2d, c2d, x_sq_1d, c_sq, out_1d, BM, BN, use_ws=use_ws
+                x2d, c2d, c_sq, out_1d, BM, BN, use_ws=use_ws
             )
         except Exception as exc:  # JIT compile failure (rare)
             if verbose:
@@ -408,19 +412,18 @@ def _autotune_pick(
 
         x_dl = _cached_from_dlpack(x2d)
         c_dl = _cached_from_dlpack(c2d)
-        xs_dl = _cached_from_dlpack(x_sq_1d)
         cs_dl = _cached_from_dlpack(c_sq)
         o_dl = _cached_from_dlpack(out_1d)
 
         try:
             for _ in range(warmup):
-                compiled(x_dl, c_dl, xs_dl, cs_dl, o_dl, stream)
+                compiled(x_dl, c_dl, cs_dl, o_dl, stream)
             torch.cuda.synchronize()
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
             for _ in range(repeats):
-                compiled(x_dl, c_dl, xs_dl, cs_dl, o_dl, stream)
+                compiled(x_dl, c_dl, cs_dl, o_dl, stream)
             e.record()
             torch.cuda.synchronize()
             t_us = s.elapsed_time(e) / repeats * 1000
@@ -453,7 +456,6 @@ def _autotune_pick(
 def cutedsl_assign_euclid(
     x: torch.Tensor,            # (B, N, D)
     centroids: torch.Tensor,    # (B, K, D)
-    x_sq: torch.Tensor,         # (B, N) fp32
     out: Optional[torch.Tensor] = None,
     c_sq: Optional[torch.Tensor] = None,
     *,
@@ -468,10 +470,12 @@ def cutedsl_assign_euclid(
 ) -> torch.Tensor:
     """Compute nearest-centroid IDs, fused (no materialised cross matrix).
 
-    Falls back to ``euclid_assign_triton`` when the input shape/dtype is
-    outside the kernel's supported regime (B>1, non-fp16/bf16, D not
-    a multiple of 16, SMEM too small, etc.). Callers do not need to
-    branch.
+    Computes ``argmin_y ||x − y||²`` via the shifted form
+    ``d'[m, k] = ||y_k||² − 2·x_m·y_k`` (drops ``||x||²`` — see module
+    docstring). Falls back to ``euclid_assign_triton`` when the input
+    shape/dtype is outside the kernel's supported regime (B>1, non-
+    fp16/bf16, D not a multiple of 16, SMEM too small, etc.). Callers
+    do not need to branch.
 
     Parameters
     ----------
@@ -490,11 +494,10 @@ def cutedsl_assign_euclid(
     autotune_verbose:
         If True, prints per-config timings during the autotune sweep.
     """
-    assert x.is_cuda and centroids.is_cuda and x_sq.is_cuda
+    assert x.is_cuda and centroids.is_cuda
     B, N, D = x.shape
     K = centroids.shape[1]
     assert centroids.shape == (B, K, D)
-    assert x_sq.shape == (B, N)
     if out is None:
         out = torch.empty((B, N), device=x.device, dtype=torch.int32)
 
@@ -507,18 +510,18 @@ def cutedsl_assign_euclid(
 
     # ---- fallback gates ---------------------------------------------------
     if not _try_init_cutedsl() or B != 1:
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
     if x.dtype not in (torch.float16, torch.bfloat16):
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
     if centroids.dtype != x.dtype:
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
     if D % 16 != 0:
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
     if D > 512:
         # The fused kernel is small-D only (the X tile fits in SMEM).
         # split-D (X-streaming) extension is tracked separately; for now
         # fall back to Triton for very wide features.
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
     # Launch-bound tiny problems: D ≤ 16 and very small K. The CuteDSL
     # kernel has fixed mbarrier+TMA setup overhead (~5-10 us) that
     # Triton's vectorised launch dodges, so for shapes where the inner
@@ -526,11 +529,11 @@ def cutedsl_assign_euclid(
     # crossover sits around (D ≤ 16, K ≤ 16) — every other shape we
     # tested (D=16 K=64 and up) wins on CuteDSL.
     if D <= 16 and K <= 16:
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
 
     # ---- contiguity normalisation -----------------------------------------
     # The fused kernel needs k-major (D contiguous) X and centroids and
-    # 1-D contiguous x_sq, c_sq, out.
+    # 1-D contiguous c_sq, out.
     x2d = x.view(N, D)
     c2d = centroids.view(K, D)
     if not x2d.is_contiguous():
@@ -543,9 +546,6 @@ def cutedsl_assign_euclid(
         c_sq = c_sq.view(K)
         if not c_sq.is_contiguous():
             c_sq = c_sq.contiguous()
-    x_sq_1d = x_sq.view(N)
-    if not x_sq_1d.is_contiguous():
-        x_sq_1d = x_sq_1d.contiguous()
     out_1d = out.view(N)
     if not out_1d.is_contiguous():
         out_1d = out_1d.contiguous()
@@ -566,7 +566,7 @@ def cutedsl_assign_euclid(
         if cached is None:
             try:
                 BM, BN, use_ws, t_us = _autotune_pick(
-                    x2d, c2d, x_sq_1d, c_sq, out_1d,
+                    x2d, c2d, c_sq, out_1d,
                     verbose=autotune_verbose,
                 )
                 _autotune_cache[ac_key] = (BM, BN, use_ws)
@@ -586,20 +586,19 @@ def cutedsl_assign_euclid(
     # ---- compile or fetch cached, then dispatch ---------------------------
     try:
         compiled, stream = _get_compiled_assign(
-            x2d, c2d, x_sq_1d, c_sq, out_1d, BM, BN, use_ws=use_ws,
+            x2d, c2d, c_sq, out_1d, BM, BN, use_ws=use_ws,
         )
     except Exception:
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
 
     try:
         compiled(
             _cached_from_dlpack(x2d), _cached_from_dlpack(c2d),
-            _cached_from_dlpack(x_sq_1d), _cached_from_dlpack(c_sq),
-            _cached_from_dlpack(out_1d),
+            _cached_from_dlpack(c_sq), _cached_from_dlpack(out_1d),
             stream,
         )
     except Exception:
-        return euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq_for_tri)
+        return euclid_assign_triton(x, centroids, out=out, c_sq=c_sq_for_tri)
 
     return out
 
@@ -627,8 +626,6 @@ def cutedsl_kmeans_Euclid(
     assert B == 1, "cutedsl path currently supports B=1 only"
     K = n_clusters
 
-    x_sq = (x ** 2).sum(dim=-1)
-
     if init_centroids is None:
         indices = torch.randint(0, N, (B, K), device=x.device)
         centroids = torch.gather(
@@ -649,7 +646,7 @@ def cutedsl_kmeans_Euclid(
     cur, nxt = centroids_a, centroids_b
     for it in range(max_iters):
         cluster_ids = cutedsl_assign_euclid(
-            x, cur, x_sq, out=cluster_ids_buf,
+            x, cur, out=cluster_ids_buf,
         )
         new_cents, _, max_shift = triton_lloyd_centroid_step_euclid(
             x, cluster_ids, cur,

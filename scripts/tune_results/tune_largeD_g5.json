@@ -1,0 +1,128 @@
+[
+  {
+    "N": 65536,
+    "K": 256,
+    "D": 1024,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 146.561598777771
+  },
+  {
+    "N": 65536,
+    "K": 4096,
+    "D": 1024,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "BLOCK_D": 64,
+      "num_warps": 4,
+      "num_stages": 4
+    },
+    "time_us": 2251.1184692382812
+  },
+  {
+    "N": 65536,
+    "K": 65536,
+    "D": 1024,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "BLOCK_D": 64,
+      "num_warps": 4,
+      "num_stages": 4
+    },
+    "time_us": 38440.655517578125
+  },
+  {
+    "N": 65536,
+    "K": 256,
+    "D": 2048,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 280.8448076248169
+  },
+  {
+    "N": 65536,
+    "K": 4096,
+    "D": 2048,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 4636.072158813477
+  },
+  {
+    "N": 65536,
+    "K": 65536,
+    "D": 2048,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 80850.48217773438
+  },
+  {
+    "N": 65536,
+    "K": 256,
+    "D": 4096,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 546.3888168334961
+  },
+  {
+    "N": 65536,
+    "K": 4096,
+    "D": 4096,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 9349.832153320312
+  },
+  {
+    "N": 65536,
+    "K": 65536,
+    "D": 4096,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 157529.3701171875
+  }
+]

@@ -5,10 +5,22 @@ import triton.language as tl
 
 # ===============================================================
 # Triton kernel: compute nearest-centroid IDs (Euclidean distance)
+#
+# ``||x − y||² = ||x||² + ||y||² − 2·x·y``. Since ``||x||²`` is constant
+# per row, it shifts every centroid's distance by the same amount and
+# does not affect ``argmin_y``. We therefore compute
+#
+#     d'[m, k] = ||y_k||² − 2·x_m·y_k          (== ||x − y||² − ||x||²)
+#
+# and pick the argmin over ``k``. This drops the ``x_sq`` HBM tensor,
+# its precompute pass, its per-tile load, and one fp32 ADD per acc
+# element. The shifted ``d'`` is no longer non-negative (the underflow
+# clamp ``max(dist, 0)`` is also dropped) but that never mattered for
+# argmin selection.
+#
 # Inputs:
 #   x           : (B, N, D)  float16 / float32
 #   centroids   : (B, K, D)  same dtype as x
-#   x_sq        : (B, N)     float32 – pre-computed ||x||^2 per point
 # Output:
 #   cluster_ids : (B, N)     int32   – nearest centroid index per point
 # ===============================================================
@@ -120,7 +132,7 @@ def _smem_bytes(D: int, BN: int, BK: int, num_stages: int, dtype_bytes: int) -> 
     - ``num_stages`` copies of ``c_tile`` of shape (D, BK) for the software
       pipelined K loop.
 
-    Other buffers (x_sq, c_sq, masks, accumulators) are negligible compared
+    Other buffers (c_sq, masks, accumulators) are negligible compared
     to these and are ignored.
     """
     return D * dtype_bytes * (BN + num_stages * BK)
@@ -314,79 +326,95 @@ def _fit_config_to_smem_split_d(
 
 
 def _heuristic_euclid_config_h200_smallD(N: int, K: int, D: int, dtype) -> dict:
-    if not _is_half_dtype(dtype):
-        # H200 fp32 small-D table, derived from a focused grid sweep
-        # (N ∈ {65536, 262144, 1048576}, K ∈ {256..200000}, B=1).
-        # The kernel SMEM scales with `D * dtype_bytes`, so fp32 prefers
-        # narrower tiles than fp16 — especially at D=512 where only the
-        # smallest BN/BK combo fits H200's 226 KiB per-block budget.
+    """H200 small-D heuristic for the no-xsq kernel.
+
+    Derived from a fresh grid sweep
+    (``scripts/tune_euclid_h200.py``) after dropping the ``||x||²``
+    load and the underflow clamp from ``_euclid_assign_kernel``:
+    N ∈ {65536, 1048576}, K ∈ {256, 4096, 65536, 200000},
+    D ∈ {64, 128, 256, 512}, B=1, fp16+fp32.
+
+    Patterns the new kernel selects (each branch annotates the cells
+    that voted for it):
+
+    fp32
+        - D=64 K≤256                  : BN=128 BK=64 W=4 S=1
+        - D=64 256<K≤65K              : BN=128 BK=128 W=4 S=1
+        - D=64 K>65K                  : BN=128 BK=64 W=4 S=1
+        - D=128 K≤4K                  : BN=128 BK=64 W=4 S=1
+        - D=128 K>4K                  : BN=128 BK=64 W=8 S=1
+        - D=256                       : BN=128 BK=64 W=8 S=1
+        - D=512 (and 320/384/448)     : BN=64 BK=32 W=4 S=1
+          (fp32 + wide-D only fits H200's 226 KiB SMEM with the smallest tile)
+
+    fp16 / bf16
+        - D=64 K≤256                  : BN=128 BK=128 W=4 S=2
+        - D=64 256<K<200K             : BN=64 BK=128 W=4 S=4   (deeper pipeline + 2× D-amortisation)
+        - D=64 K≥200K                 : BN=128 BK=64 W=4 S=4
+        - D=128 K≤256                 : BN=128 BK=64 W=4 S=1
+        - D=128 256<K≤65K             : BN=128 BK=128 W=8 S=2
+        - D=128 K>65K                 : BN=128 BK=64 W=4 S=1
+        - D=256 K≤4K                  : BN=128 BK=64 W=4 S=1
+        - D=256 K>4K                  : BN=128 BK=64 W=8 S=1
+        - D≥320 (i.e. D=512)          : BN=128 BK=64 W=8 S=1
+
+    Tiny N (<65536) shrinks BN to 64 to avoid wasted work — kept as a
+    guard since the new sweep only covered N≥65536.
+    """
+    half = _is_half_dtype(dtype)
+
+    if not half:
+        # ---- fp32 path ------------------------------------------------------
         if D <= 64:
             if K <= 256:
                 return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
             if K <= 65536:
-                return {"BLOCK_N": 128, "BLOCK_K": 128, "num_warps": 8, "num_stages": 2}
-            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 4}
+                return {"BLOCK_N": 128, "BLOCK_K": 128, "num_warps": 4, "num_stages": 1}
+            return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
         if D <= 128:
-            if K <= 256:
-                return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
-            if K <= 16384:
+            if K <= 4096:
                 return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
             return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
         if D <= 256:
             return {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
-        # D == 512 (or 320/384/448 — any value the small-D kernel still
-        # accepts but only fits with the smallest tile under fp32).
-        return {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+        # D ≥ 320 (typically 512). Only the smallest fp32 tile fits SMEM.
+        cfg = {"BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 1}
+        if N < 65536:
+            cfg = dict(cfg)
+            cfg["BLOCK_N"] = 32
+        return cfg
 
-    # fp16/bf16 path: original hand-tuned table — leave byte-for-byte
-    # identical so examples/regression_fp16_smalld.py keeps passing.
-    block_n = 128
-    block_k = 64
-    num_warps = 4
-    num_stages = 1
-
-    if D >= 512:
-        block_n = 128
-        block_k = 64
-        num_warps = 8
-        num_stages = 1
-    elif D >= 256:
-        block_n = 128
-        block_k = 64
-        num_warps = 4
-        num_stages = 2
-    else:
-        # D <= 128
-        if K >= 4096:
-            block_k = 128
-            if D >= 128:
-                num_warps = 8
-                num_stages = 2
-            else:
-                num_warps = 4
-                num_stages = 4
+    # ---- fp16 / bf16 path ---------------------------------------------------
+    if D <= 64:
+        if K <= 256:
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 128, "num_warps": 4, "num_stages": 2}
+        elif K < 200_000:
+            cfg = {"BLOCK_N": 64, "BLOCK_K": 128, "num_warps": 4, "num_stages": 4}
         else:
-            block_k = 64
-            num_warps = 4
-            num_stages = 1
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 4}
+    elif D <= 128:
+        if K <= 256:
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+        elif K <= 65536:
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 128, "num_warps": 8, "num_stages": 2}
+        else:
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+    elif D <= 256:
+        if K <= 4096:
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 4, "num_stages": 1}
+        else:
+            cfg = {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
+    else:
+        # D ≥ 320 (typically 512).
+        cfg = {"BLOCK_N": 128, "BLOCK_K": 64, "num_warps": 8, "num_stages": 1}
 
-    # D=64 with large K tends to prefer smaller BLOCK_N and deeper pipeline.
-    if D <= 64 and K >= 4096:
-        block_n = 64
-        block_k = 128
-        num_warps = 4
-        num_stages = 4
-
-    # Smaller N favors smaller BLOCK_N to reduce wasted work.
+    # Smaller N favors smaller BLOCK_N to reduce wasted work; the sweep
+    # only covered N ≥ 65536, so retain the historical guard for tiny N.
     if N < 65536:
-        block_n = 64
+        cfg = dict(cfg)
+        cfg["BLOCK_N"] = 64
 
-    return {
-        "BLOCK_N": block_n,
-        "BLOCK_K": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-    }
+    return cfg
 
 
 def _heuristic_euclid_config_h100_smallD(N: int, K: int, D: int, dtype) -> dict:
@@ -785,7 +813,6 @@ def _need_split_d(D: int, dtype, device) -> bool:
 def _euclid_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
     c_ptr,                 # *f16 / *f32 [B, K, D]
-    x_sq_ptr,              # *f32         [B, N]
     c_sq_ptr,              # *f32         [B, K]
     out_ptr,               # *i32         [B, N]
     B: tl.constexpr,
@@ -798,8 +825,6 @@ def _euclid_assign_kernel(
     stride_c_b: tl.constexpr,
     stride_c_k: tl.constexpr,
     stride_c_d: tl.constexpr,
-    stride_xsq_b: tl.constexpr,
-    stride_xsq_n: tl.constexpr,
     stride_csq_b: tl.constexpr,
     stride_csq_k: tl.constexpr,
     stride_out_b: tl.constexpr,
@@ -810,8 +835,10 @@ def _euclid_assign_kernel(
     """Each program handles a tile of BLOCK_N points for a given batch element.
 
     The kernel iterates over the centroid dimension K in chunks of BLOCK_K and
-    maintains the running minimum distance as well as the corresponding index
-    for every point in the tile.
+    maintains the running minimum *shifted* distance as well as the
+    corresponding index for every point in the tile. The shift is the
+    per-row ``||x||²`` term, which is constant across centroids and so
+    does not affect argmin (see module docstring).
     """
     pid_n = tl.program_id(0)          # tile index along N dimension
     pid_b = tl.program_id(1)          # batch index
@@ -834,14 +861,9 @@ def _euclid_assign_kernel(
         + offs_d[None, :] * stride_x_d
     )
     x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
-    x_tile = x_tile  # compute in f32
 
-    # Pre-load x_sq for the tile  (BLOCK_N,)
-    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
-    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
-
-    # Init best distance / index
-    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)  # large number
+    # Init best (shifted) distance / index.
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
     # ------------------------------------------------------------------
@@ -860,23 +882,18 @@ def _euclid_assign_kernel(
             + offs_d[:, None] * stride_c_d
         )
         c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
-        c_tile = c_tile
 
         # load c_sq for the tile  (BLOCK_K,)
         csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
         cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-        # # Compute centroid squared norms (BLOCK_K,)
-        # cent_sq = tl.sum(c_tile * c_tile, axis=0).to(tl.float32)
+        # Cross term (BLOCK_N, BLOCK_K) = x_tile @ c_tile
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)
 
-        # Compute cross term (BLOCK_N, BLOCK_K) = x_tile @ c_tile
-        cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
+        # Shifted distance: ||y||² − 2·x·y (no x_sq, no clamp).
+        dist = cent_sq[None, :] - 2.0 * cross
 
-        # Squared Euclidean distance
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
-        dist = tl.maximum(dist, 0.0)
-
-        # Mask out invalid centroid columns before reduction
+        # Mask out invalid centroid columns before reduction.
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
 
         curr_min = tl.min(dist, axis=1)
@@ -909,7 +926,6 @@ _euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])
 def _euclid_assign_kernel_split_d(
     x_ptr,                 # *f16 / *f32 [B, N, D]
     c_ptr,                 # *f16 / *f32 [B, K, D]
-    x_sq_ptr,              # *f32         [B, N]
     c_sq_ptr,              # *f32         [B, K]
     out_ptr,               # *i32         [B, N]
     B: tl.constexpr,
@@ -922,8 +938,6 @@ def _euclid_assign_kernel_split_d(
     stride_c_b: tl.constexpr,
     stride_c_k: tl.constexpr,
     stride_c_d: tl.constexpr,
-    stride_xsq_b: tl.constexpr,
-    stride_xsq_n: tl.constexpr,
     stride_csq_b: tl.constexpr,
     stride_csq_k: tl.constexpr,
     stride_out_b: tl.constexpr,
@@ -942,10 +956,6 @@ def _euclid_assign_kernel_split_d(
     n_mask = n_offsets < N
 
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
-
-    # Pre-load x_sq for the tile (BLOCK_N,)
-    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
-    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
 
     best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
@@ -991,8 +1001,7 @@ def _euclid_assign_kernel_split_d(
 
             cross += tl.dot(x_chunk, c_chunk).to(tl.float32)
 
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
-        dist = tl.maximum(dist, 0.0)
+        dist = cent_sq[None, :] - 2.0 * cross
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
 
         curr_min = tl.min(dist, axis=1)
@@ -1211,7 +1220,6 @@ _cosine_assign_kernel_split_d_autotuned = triton.autotune(
 def euclid_assign_triton(
     x: torch.Tensor,
     centroids: torch.Tensor,
-    x_sq: torch.Tensor,
     out: torch.Tensor = None,
     c_sq: torch.Tensor = None,
     *,
@@ -1224,10 +1232,13 @@ def euclid_assign_triton(
 ) -> torch.Tensor:
     """Return nearest-centroid indices using Triton kernel.
 
+    Computes ``argmin_y ||x − y||²`` via the shifted form
+    ``d'[m, k] = ||y_k||² − 2·x_m·y_k`` (no ``||x||²`` term — it is
+    constant per row and cancels in the argmin).
+
     Args:
         x         : (B, N, D) float16 / float32 (on CUDA)
         centroids : (B, K, D) same dtype/device as x
-        x_sq      : (B, N)    float32 – ||x||^2 per point (on CUDA)
         out       : (B, N)    int32   – (option) pre-allocated output tensor (on CUDA)
         c_sq      : (B, K)    float32 – (option) ||centroids||^2 per centroid (on CUDA)
 
@@ -1237,18 +1248,12 @@ def euclid_assign_triton(
         config        : {"BLOCK_N","BLOCK_K","num_warps","num_stages"} to force a config
         use_heuristic : use a fixed heuristic config instead of autotune
     """
-    assert x.is_cuda and centroids.is_cuda and x_sq.is_cuda, "All tensors must be on CUDA"
-    # assert x.dtype in (torch.float16, torch.float32), "x must be fp16/fp32"
+    assert x.is_cuda and centroids.is_cuda, "All tensors must be on CUDA"
     assert centroids.dtype == x.dtype, "centroids dtype mismatch"
 
     B, N, D = x.shape
     K = centroids.shape[1]
     assert centroids.shape == (B, K, D), "centroids shape mismatch"
-    assert x_sq.shape == (B, N), "x_sq shape mismatch"
-
-    # x = x.contiguous()
-    # centroids = centroids.contiguous()
-    # x_sq = x_sq.contiguous()
 
     if out is None:
         out = torch.empty((B, N), device=x.device, dtype=torch.int32)
@@ -1258,7 +1263,6 @@ def euclid_assign_triton(
     # Strides (in elements)
     stride_x_b, stride_x_n, stride_x_d = x.stride()
     stride_c_b, stride_c_k, stride_c_d = centroids.stride()
-    stride_xsq_b, stride_xsq_n = x_sq.stride()
     stride_csq_b, stride_csq_k = c_sq.stride()
     stride_out_b, stride_out_n = out.stride()
 
@@ -1302,21 +1306,19 @@ def euclid_assign_triton(
     if use_split_d:
         if selected_config is None:
             _euclid_assign_kernel_split_d_autotuned[grid](
-                x, centroids, x_sq, c_sq, out,
+                x, centroids, c_sq, out,
                 B, N, K, D,
                 stride_x_b, stride_x_n, stride_x_d,
                 stride_c_b, stride_c_k, stride_c_d,
-                stride_xsq_b, stride_xsq_n,
                 stride_csq_b, stride_csq_k,
                 stride_out_b, stride_out_n,
             )
         else:
             _euclid_assign_kernel_split_d[grid](
-                x, centroids, x_sq, c_sq, out,
+                x, centroids, c_sq, out,
                 B, N, K, D,
                 stride_x_b, stride_x_n, stride_x_d,
                 stride_c_b, stride_c_k, stride_c_d,
-                stride_xsq_b, stride_xsq_n,
                 stride_csq_b, stride_csq_k,
                 stride_out_b, stride_out_n,
                 BLOCK_N=selected_config["BLOCK_N"],
@@ -1331,7 +1333,6 @@ def euclid_assign_triton(
         _euclid_assign_kernel[grid](
             x,
             centroids,
-            x_sq,
             c_sq,
             out,
             B,
@@ -1344,8 +1345,6 @@ def euclid_assign_triton(
             stride_c_b,
             stride_c_k,
             stride_c_d,
-            stride_xsq_b,
-            stride_xsq_n,
             stride_csq_b,
             stride_csq_k,
             stride_out_b,
@@ -1359,7 +1358,6 @@ def euclid_assign_triton(
         _euclid_assign_kernel_autotuned[grid](
             x,
             centroids,
-            x_sq,
             c_sq,
             out,
             B,
@@ -1372,8 +1370,6 @@ def euclid_assign_triton(
             stride_c_b,
             stride_c_k,
             stride_c_d,
-            stride_xsq_b,
-            stride_xsq_n,
             stride_csq_b,
             stride_csq_k,
             stride_out_b,
@@ -1403,7 +1399,6 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
 
     # x = x.contiguous()
     # centroids = centroids.contiguous()
-    # x_sq = x_sq.contiguous()
 
     if out is None:
         out = torch.empty((B, N), device=x.device, dtype=torch.int32)
@@ -1481,13 +1476,13 @@ if __name__ == "__main__":
     cent = torch.randn(B, K, D, device="cuda", dtype=dtype)
     x_sq = (x.to(torch.float32) ** 2).sum(-1)
 
-    # Reference
+    # Reference (full distance, includes x_sq — for ground-truth argmin only)
     dist = (
         x_sq.unsqueeze(-1) + (cent.to(torch.float32) ** 2).sum(-1).unsqueeze(1) - 2.0 * torch.einsum("bnd,bkd->bnk", x, cent).to(torch.float32)
     ).clamp_min_(0.0)
     ref_ids = dist.argmin(dim=-1)
 
-    tri_ids = euclid_assign_triton(x, cent, x_sq, out)
+    tri_ids = euclid_assign_triton(x, cent, out)
 
     print("Correct:", torch.equal(ref_ids.cpu(), tri_ids.cpu()))
 
@@ -1505,7 +1500,7 @@ if __name__ == "__main__":
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(repeats):
-        euclid_assign_triton(x, cent, x_sq, out)
+        euclid_assign_triton(x, cent, out)
     end.record(); torch.cuda.synchronize()
     print(f"Avg time Triton: {start.elapsed_time(end)/repeats:.3f} ms for {B}x{N} points vs {K} centroids") 
     print(f"{ref_ids[10, 69344]=}, {tri_ids[10, 69344]=}, {dist[10, 69344, ref_ids[10, 69344]]=}, {dist[10, 69344, tri_ids[10, 69344]]=}")

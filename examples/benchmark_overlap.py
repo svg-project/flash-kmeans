@@ -64,7 +64,6 @@ def kmeans_largeN_no_overlap(
     streams = {}
     centroids_g = {}
     cluster_ids_g = {}
-    x_sq_cache_g = {}
 
     for g in active_gpus:
         dev = devices[g]
@@ -72,7 +71,6 @@ def kmeans_largeN_no_overlap(
             streams[g] = torch.cuda.Stream(device=dev)
             n_pts = point_end[g] - point_start[g]
             cluster_ids_g[g] = torch.empty((n_pts,), device=dev, dtype=torch.int32)
-            x_sq_cache_g[g] = [None] * blocks_per_gpu[g]
 
     # --- Init centroids ---
     with torch.cuda.device(primary_dev):
@@ -130,16 +128,12 @@ def kmeans_largeN_no_overlap(
                         # --- H2D: synchronous copy (blocks stream until done) ---
                         x_block = x[n_start:n_end].to(dev, non_blocking=False, dtype=dtype)
 
-                        if x_sq_cache_g[g][local_idx] is None:
-                            x_sq_cache_g[g][local_idx] = (x_block ** 2).sum(dim=-1)
-
                         local_offset = local_idx * BLOCK_N
                         local_end = min(local_offset + BLOCK_N, point_end[g] - ps)
 
                         cluster_ids_block = euclid_assign_triton(
                             x_block.unsqueeze(0),
                             centroids_g[g].unsqueeze(0),
-                            x_sq_cache_g[g][local_idx].unsqueeze(0),
                             out=cluster_ids_g[g][local_offset:local_end].unsqueeze(0),
                             c_sq=c_sq_g[g].unsqueeze(0),
                         )

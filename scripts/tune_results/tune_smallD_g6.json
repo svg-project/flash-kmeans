@@ -1,0 +1,210 @@
+[
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 64,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 148.38720560073853
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 64,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "time_us": 1947.4863052368164
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 64,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 31611.407470703125
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 64,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 4
+    },
+    "time_us": 99951.9287109375
+  },
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 128,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 198.51679801940918
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 128,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "time_us": 2588.368034362793
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 128,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "time_us": 44776.24816894531
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 128,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 144662.95166015625
+  },
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 256,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 388.919997215271
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 256,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 4,
+      "num_stages": 1
+    },
+    "time_us": 5015.69938659668
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 256,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 87568.5791015625
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 256,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 266354.3701171875
+  },
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 512,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 839.7199630737305
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 512,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 10598.955535888672
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 512,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 198314.90478515625
+  },
+  {
+    "N": 1048576,
+    "K": 200000,
+    "D": 512,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    },
+    "time_us": 616189.55078125
+  }
+]

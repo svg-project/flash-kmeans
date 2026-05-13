@@ -1,17 +1,20 @@
 import torch
 import torch.nn.functional as F
 
-def euclid_assign_torch_native_chunked(x, centroids, x_sq, chunk_size_N=32768, chunk_size_K=1024):
+def euclid_assign_torch_native_chunked(x, centroids, chunk_size_N=32768, chunk_size_K=1024):
     """
     Torch naive implementation for assignment with chunking to avoid OOM.
-    
+
+    Uses the shifted distance ``d'[m, k] = ||y_k||² − 2·x_m·y_k`` which
+    shares its argmin with the true squared distance — the ``||x||²``
+    term is constant per row and cancels.
+
     Args:
         x: (B, N, D) input points
         centroids: (B, K, D) cluster centers
-        x_sq: (B, N) pre-computed ||x||^2
         chunk_size_N: chunk size along N dimension
         chunk_size_K: chunk size along K dimension
-        
+
     Returns:
         cluster_ids: (B, N) int32 cluster assignment per point
     """
@@ -28,7 +31,6 @@ def euclid_assign_torch_native_chunked(x, centroids, x_sq, chunk_size_N=32768, c
     for n_start in range(0, N, chunk_size_N):
         n_end = min(n_start + chunk_size_N, N)
         x_chunk = x[:, n_start:n_end, :]  # (B, n_chunk, D)
-        x_sq_chunk = x_sq[:, n_start:n_end]  # (B, n_chunk)
 
         dists_chunk = torch.empty((B, n_end - n_start, K), device=x.device)
 
@@ -37,18 +39,17 @@ def euclid_assign_torch_native_chunked(x, centroids, x_sq, chunk_size_N=32768, c
             cent_chunk = centroids[:, k_start:k_end, :]  # (B, k_chunk, D)
             cent_sq_chunk = cent_sq[:, k_start:k_end]  # (B, k_chunk)
 
-            # Compute squared distances
+            # Shifted squared distance: c_sq − 2·x·c (no x_sq term).
             dists_partial = (
-                x_sq_chunk.unsqueeze(-1)  # (B, n_chunk, 1)
+                cent_sq_chunk.unsqueeze(-2)  # (B, 1, k_chunk)
                 - 2 * torch.bmm(x_chunk, cent_chunk.transpose(1, 2))  # (B, n_chunk, k_chunk)
-                + cent_sq_chunk.unsqueeze(-2)  # (B, 1, k_chunk)
             )  # (B, n_chunk, k_chunk)
 
             dists_chunk[:, :, k_start:k_end] = dists_partial
 
         # Assign cluster ids
         cluster_ids[:, n_start:n_end] = torch.argmin(dists_chunk, dim=-1)
-    
+
     return cluster_ids
 
 def torch_loop_centroid_update(x_norm: torch.Tensor, cluster_ids: torch.Tensor, old_centroids: torch.Tensor, mode = 'euclid'):
@@ -108,13 +109,12 @@ def _centroid_update_torch_native(x, cluster_ids, old_centroids, mode = 'euclid'
     return centroids.to(x.dtype)
 
 
-def _euclid_iter_torch_naive(x, x_sq, centroids, chunk_size_N=32768, chunk_size_K=1024):
+def _euclid_iter_torch_naive(x, centroids, chunk_size_N=32768, chunk_size_K=1024):
     """
     One iteration of KMeans using pure PyTorch (fallback when Triton is not available).
     
     Args:
         x: (B, N, D) input points
-        x_sq: (B, N) pre-computed ||x||^2
         centroids: (B, K, D) cluster centers
         chunk_size: chunk size for assignment to avoid OOM
         
@@ -124,7 +124,7 @@ def _euclid_iter_torch_naive(x, x_sq, centroids, chunk_size_N=32768, chunk_size_
         cluster_ids: (B, N) cluster assignments
     """
     # Assignment step: find nearest centroid for each point
-    cluster_ids = euclid_assign_torch_native_chunked(x, centroids, x_sq, chunk_size_N, chunk_size_K)
+    cluster_ids = euclid_assign_torch_native_chunked(x, centroids, chunk_size_N, chunk_size_K)
 
     # Update step: recompute centroids
     centroids_new = _centroid_update_torch_native(x, cluster_ids, centroids)
@@ -150,9 +150,6 @@ def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init
     """
     B, N, D = x.shape
 
-    # Pre-compute squared L2 norm of all points (constant during iterations)
-    x_sq = (x ** 2).sum(dim=-1)  # (B, N)
-
     if init_centroids is None:
         # Randomly select initial centers from x
         indices = torch.randint(0, N, (B, n_clusters), device=x.device)
@@ -167,7 +164,7 @@ def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init
     centroids = centroids.view(B, n_clusters, D)
 
     for it in range(max_iters):
-        centroids_new, center_shift, cluster_ids = _euclid_iter_torch_naive(x, x_sq, centroids, chunk_size_N, chunk_size_K)
+        centroids_new, center_shift, cluster_ids = _euclid_iter_torch_naive(x, centroids, chunk_size_N, chunk_size_K)
 
         if verbose:
             print(f"Iter {it}, center shift: {center_shift.item():.6f}")
@@ -184,19 +181,12 @@ if __name__ == "__main__":
     B, N, D, K = 32, 74256, 128, 1000
     x = torch.randn(B, N, D, device="cuda")
     cent = torch.randn(B, K, D, device="cuda")
-    x_sq = (x.to(torch.float32) ** 2).sum(-1)
     centroids = torch.randn(B, K, D, device='cuda')
 
 
     ## test _euclid_assign_torch_chunked
 
-    # torch ref
-    # dist = (
-    #     x_sq.unsqueeze(-1) + (cent.to(torch.float32) ** 2).sum(-1).unsqueeze(1) - 2.0 * torch.einsum("bnd,bkd->bnk", x, cent).to(torch.float32)
-    # ).clamp_min_(0.0)
-    # ref_ids = dist.argmin(dim=-1)
-    # _euclid_assign_torch_chunked
-    impl_ids = euclid_assign_torch_native_chunked(x, cent, x_sq) 
+    impl_ids = euclid_assign_torch_native_chunked(x, cent) 
 
     # torch.testing.assert_close(ref_ids.to(torch.float32), impl_ids.to(torch.float32))
 

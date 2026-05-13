@@ -1,0 +1,108 @@
+Launching GPU 4 kind=smallD -> scripts/tune_results/tune_smallD_g4.json
+Launching GPU 5 kind=smallD -> scripts/tune_results/tune_smallD_g5.json
+Launching GPU 6 kind=smallD -> scripts/tune_results/tune_smallD_g6.json
+Launching GPU 7 kind=smallD -> scripts/tune_results/tune_smallD_g7.json
+Worker shard=0/4 kind=smallD cells=16 (of 64)  out=scripts/tune_results/tune_smallD_g4.json
+[1/16] N=65536 K=256 D=64 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 2} (15.6 us)  cell_time=13.0s  elapsed=13.0s
+Worker shard=2/4 kind=smallD cells=16 (of 64)  out=scripts/tune_results/tune_smallD_g6.json
+[1/16] N=1048576 K=256 D=64 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (148.4 us)  cell_time=13.3s  elapsed=13.3s
+Worker shard=1/4 kind=smallD cells=16 (of 64)  out=scripts/tune_results/tune_smallD_g5.json
+[1/16] N=65536 K=256 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (17.6 us)  cell_time=14.3s  elapsed=14.3s
+Worker shard=3/4 kind=smallD cells=16 (of 64)  out=scripts/tune_results/tune_smallD_g7.json
+[1/16] N=1048576 K=256 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (199.7 us)  cell_time=14.8s  elapsed=14.8s
+[2/16] N=65536 K=4096 D=64 dt=fp16: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 4} (135.4 us)  cell_time=10.2s  elapsed=23.2s
+[2/16] N=65536 K=4096 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 1} (167.0 us)  cell_time=12.0s  elapsed=26.3s
+[2/16] N=1048576 K=4096 D=64 dt=fp16: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 2} (1947.5 us)  cell_time=15.1s  elapsed=28.3s
+[2/16] N=1048576 K=4096 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 1} (2560.7 us)  cell_time=18.7s  elapsed=33.6s
+[3/16] N=65536 K=65536 D=64 dt=fp16: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 4} (2045.2 us)  cell_time=15.7s  elapsed=38.9s
+[3/16] N=65536 K=65536 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 1} (2550.4 us)  cell_time=19.3s  elapsed=45.6s
+[4/16] N=65536 K=200000 D=64 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 4} (6623.3 us)  cell_time=27.6s  elapsed=66.5s
+[5/16] N=65536 K=256 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (17.7 us)  cell_time=12.2s  elapsed=78.8s
+[6/16] N=65536 K=4096 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 1} (165.9 us)  cell_time=0.6s  elapsed=79.4s
+[4/16] N=65536 K=200000 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (8719.5 us)  cell_time=36.8s  elapsed=82.5s
+[5/16] N=65536 K=256 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (28.7 us)  cell_time=13.1s  elapsed=95.6s
+[7/16] N=65536 K=65536 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 4, 'num_stages': 1} (2611.9 us)  cell_time=19.9s  elapsed=99.3s
+[6/16] N=65536 K=4096 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (302.2 us)  cell_time=13.2s  elapsed=108.8s
+[3/16] N=1048576 K=65536 D=64 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 8, 'num_stages': 4} (31611.4 us)  cell_time=92.7s  elapsed=121.0s
+[7/16] N=65536 K=65536 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (5294.6 us)  cell_time=25.5s  elapsed=134.3s
+[8/16] N=65536 K=200000 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (9161.9 us)  cell_time=37.5s  elapsed=136.8s
+[9/16] N=65536 K=256 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (28.7 us)  cell_time=13.9s  elapsed=150.8s
+[3/16] N=1048576 K=65536 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 8, 'num_stages': 2} (41730.2 us)  cell_time=129.2s  elapsed=162.7s
+[10/16] N=65536 K=4096 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (303.3 us)  cell_time=14.0s  elapsed=164.7s
+[8/16] N=65536 K=200000 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (16010.2 us)  cell_time=52.5s  elapsed=186.7s
+[11/16] N=65536 K=65536 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (5361.0 us)  cell_time=26.5s  elapsed=191.2s
+[9/16] N=65536 K=256 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (62.9 us)  cell_time=9.5s  elapsed=196.2s
+[10/16] N=65536 K=4096 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (670.9 us)  cell_time=10.1s  elapsed=206.3s
+[11/16] N=65536 K=65536 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (12633.3 us)  cell_time=29.8s  elapsed=236.2s
+[12/16] N=65536 K=200000 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (16792.0 us)  cell_time=53.6s  elapsed=244.9s
+[13/16] N=65536 K=256 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (62.3 us)  cell_time=10.3s  elapsed=255.2s
+[14/16] N=65536 K=4096 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (666.4 us)  cell_time=11.2s  elapsed=266.4s
+[15/16] N=65536 K=65536 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (12687.0 us)  cell_time=31.0s  elapsed=297.4s
+[12/16] N=65536 K=200000 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (38592.1 us)  cell_time=72.7s  elapsed=308.9s
+[13/16] N=65536 K=256 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (165.7 us)  cell_time=2.8s  elapsed=311.7s
+[14/16] N=65536 K=4096 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (2027.5 us)  cell_time=3.6s  elapsed=315.3s
+[15/16] N=65536 K=65536 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (46187.1 us)  cell_time=20.7s  elapsed=336.1s
+[16/16] N=65536 K=200000 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (38676.9 us)  cell_time=73.7s  elapsed=371.2s
+[4/16] N=1048576 K=200000 D=64 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 4} (99951.9 us)  cell_time=269.4s  elapsed=390.5s
+[16/16] N=65536 K=200000 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (140484.6 us)  cell_time=57.4s  elapsed=393.5s
+[5/16] N=1048576 K=256 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (198.5 us)  cell_time=12.8s  elapsed=403.3s
+[6/16] N=1048576 K=4096 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 8, 'num_stages': 2} (2588.4 us)  cell_time=19.5s  elapsed=422.8s
+[4/16] N=1048576 K=200000 D=64 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (135116.9 us)  cell_time=389.4s  elapsed=552.2s
+[7/16] N=1048576 K=65536 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'num_warps': 8, 'num_stages': 2} (44776.2 us)  cell_time=132.0s  elapsed=554.8s
+[5/16] N=1048576 K=256 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (398.6 us)  cell_time=13.8s  elapsed=566.0s
+[6/16] N=1048576 K=4096 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (4726.1 us)  cell_time=24.1s  elapsed=590.1s
+[7/16] N=1048576 K=65536 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (85913.8 us)  cell_time=213.6s  elapsed=803.7s
+[8/16] N=1048576 K=200000 D=128 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (144663.0 us)  cell_time=394.8s  elapsed=949.6s
+[9/16] N=1048576 K=256 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (388.9 us)  cell_time=14.5s  elapsed=964.1s
+[10/16] N=1048576 K=4096 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 1} (5015.7 us)  cell_time=25.0s  elapsed=989.1s
+[11/16] N=1048576 K=65536 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (87568.6 us)  cell_time=216.8s  elapsed=1205.9s
+[8/16] N=1048576 K=200000 D=128 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (247631.5 us)  cell_time=630.6s  elapsed=1434.4s
+[9/16] N=1048576 K=256 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (848.0 us)  cell_time=10.8s  elapsed=1445.2s
+[10/16] N=1048576 K=4096 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (10176.4 us)  cell_time=26.3s  elapsed=1471.5s
+[11/16] N=1048576 K=65536 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (198218.2 us)  cell_time=332.0s  elapsed=1803.5s
+[12/16] N=1048576 K=200000 D=256 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (266354.4 us)  cell_time=638.1s  elapsed=1844.0s
+[13/16] N=1048576 K=256 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (839.7 us)  cell_time=12.2s  elapsed=1856.2s
+[14/16] N=1048576 K=4096 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (10599.0 us)  cell_time=27.5s  elapsed=1883.8s
+[15/16] N=1048576 K=65536 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (198314.9 us)  cell_time=332.3s  elapsed=2216.0s
+[12/16] N=1048576 K=200000 D=256 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (615227.3 us)  cell_time=994.8s  elapsed=2798.3s
+[13/16] N=1048576 K=256 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (2404.7 us)  cell_time=3.8s  elapsed=2802.2s
+[14/16] N=1048576 K=4096 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (31329.0 us)  cell_time=16.5s  elapsed=2818.7s
+[15/16] N=1048576 K=65536 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (720339.7 us)  cell_time=281.9s  elapsed=3100.6s
+[16/16] N=1048576 K=200000 D=512 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8, 'num_stages': 1} (616189.6 us)  cell_time=992.3s  elapsed=3208.3s
+[16/16] N=1048576 K=200000 D=512 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 1} (2197482.0 us)  cell_time=854.3s  elapsed=3954.9s
+Launching GPU 4 kind=largeD -> scripts/tune_results/tune_largeD_g4.json
+Launching GPU 5 kind=largeD -> scripts/tune_results/tune_largeD_g5.json
+Launching GPU 6 kind=largeD -> scripts/tune_results/tune_largeD_g6.json
+Launching GPU 7 kind=largeD -> scripts/tune_results/tune_largeD_g7.json
+Worker shard=1/4 kind=largeD cells=9 (of 36)  out=scripts/tune_results/tune_largeD_g5.json
+[1/9] N=65536 K=256 D=1024 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (146.6 us)  cell_time=43.4s  elapsed=43.4s
+Worker shard=0/4 kind=largeD cells=9 (of 36)  out=scripts/tune_results/tune_largeD_g4.json
+[1/9] N=65536 K=256 D=1024 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (71.8 us)  cell_time=59.4s  elapsed=59.4s
+Worker shard=3/4 kind=largeD cells=9 (of 36)  out=scripts/tune_results/tune_largeD_g7.json
+[1/9] N=1048576 K=256 D=1024 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (2278.8 us)  cell_time=66.5s  elapsed=66.5s
+Worker shard=2/4 kind=largeD cells=9 (of 36)  out=scripts/tune_results/tune_largeD_g6.json
+[1/9] N=1048576 K=256 D=1024 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (1060.2 us)  cell_time=72.5s  elapsed=72.5s
+[2/9] N=65536 K=4096 D=1024 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (942.9 us)  cell_time=14.8s  elapsed=74.2s
+[2/9] N=65536 K=4096 D=1024 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 4, 'num_stages': 4} (2251.1 us)  cell_time=66.7s  elapsed=110.1s
+[2/9] N=1048576 K=4096 D=1024 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (17150.6 us)  cell_time=290.3s  elapsed=362.8s
+[3/9] N=65536 K=65536 D=1024 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (17195.9 us)  cell_time=306.4s  elapsed=380.7s
+[4/9] N=65536 K=256 D=2048 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (152.0 us)  cell_time=38.5s  elapsed=419.1s
+[5/9] N=65536 K=4096 D=2048 dt=fp16: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_D': 128, 'num_warps': 4, 'num_stages': 4} (2277.8 us)  cell_time=68.2s  elapsed=487.3s
+[2/9] N=1048576 K=4096 D=1024 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 4, 'num_stages': 4} (38344.9 us)  cell_time=455.3s  elapsed=521.8s
+[3/9] N=65536 K=65536 D=1024 dt=fp32: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 4, 'num_stages': 4} (38440.7 us)  cell_time=477.1s  elapsed=587.2s
+[4/9] N=65536 K=256 D=2048 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (280.8 us)  cell_time=43.4s  elapsed=630.6s
+[5/9] N=65536 K=4096 D=2048 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (4636.1 us)  cell_time=92.2s  elapsed=722.8s
+[6/9] N=65536 K=65536 D=2048 dt=fp16: best={'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_D': 128, 'num_warps': 4, 'num_stages': 4} (42271.0 us)  cell_time=592.8s  elapsed=1080.2s
+[7/9] N=65536 K=256 D=4096 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (290.5 us)  cell_time=40.6s  elapsed=1120.8s
+[8/9] N=65536 K=4096 D=4096 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (4860.7 us)  cell_time=102.8s  elapsed=1223.6s
+[6/9] N=65536 K=65536 D=2048 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (80850.5 us)  cell_time=947.7s  elapsed=1670.5s
+[7/9] N=65536 K=256 D=4096 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (546.4 us)  cell_time=44.9s  elapsed=1715.4s
+[8/9] N=65536 K=4096 D=4096 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (9349.8 us)  cell_time=144.6s  elapsed=1860.0s
+[9/9] N=65536 K=65536 D=4096 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (90358.1 us)  cell_time=1193.8s  elapsed=2417.4s
+[9/9] N=65536 K=65536 D=4096 dt=fp32: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 32, 'num_warps': 8, 'num_stages': 4} (157529.4 us)  cell_time=1909.8s  elapsed=3769.8s
+[3/9] N=1048576 K=65536 D=1024 dt=fp16: best={'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_D': 64, 'num_warps': 8, 'num_stages': 4} (277923.7 us)  cell_time=4221.1s  elapsed=4584.0s
+  GPU 6 kind=largeD FAILED rc=-15
+  GPU 7 kind=largeD FAILED rc=-15
+WARN: 2 workers failed; merged JSON may be partial.
+Merged 64 cells -> scripts/tune_results/tune_smallD_h200.json
+Merged 23 cells -> scripts/tune_results/tune_largeD_h200.json

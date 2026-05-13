@@ -85,7 +85,6 @@ def kmeans_largeN(
     reduce_stream = {}  # reduce_stream[g]
     centroids_g = {}    # replicated centroids on each GPU
     cluster_ids_g = {}  # local cluster_ids on each GPU
-    x_sq_cache_g = {}   # cached x_sq blocks per GPU
 
     for g in active_gpus:
         dev = devices[g]
@@ -94,7 +93,6 @@ def kmeans_largeN(
             reduce_stream[g] = torch.cuda.Stream(device=dev)
             n_points_g = point_end[g] - point_start[g]
             cluster_ids_g[g] = torch.empty((n_points_g,), device=dev, dtype=torch.int32)
-            x_sq_cache_g[g] = [None] * blocks_per_gpu[g]
 
     # Initialize centroids on reduce_stream[active_gpus[0]]
     primary_gpu = active_gpus[0]
@@ -179,10 +177,6 @@ def kmeans_largeN(
 
                         x_block = x[n_start:n_end].to(dev, non_blocking=True, dtype=dtype)
 
-                        # Cache x_sq on first iteration
-                        if x_sq_cache_g[g][local_idx] is None:
-                            x_sq_cache_g[g][local_idx] = (x_block ** 2).sum(dim=-1)
-
                         # Sequential dependency within this GPU
                         if local_idx > 0:
                             ws.wait_event(done_events[g][local_idx - 1])
@@ -194,7 +188,6 @@ def kmeans_largeN(
                         cluster_ids_block = euclid_assign_triton(
                             x_block.unsqueeze(0),
                             centroids_g[g].unsqueeze(0),
-                            x_sq_cache_g[g][local_idx].unsqueeze(0),
                             out=cluster_ids_g[g][local_offset:local_end].unsqueeze(0),
                             c_sq=c_sq_g[g].unsqueeze(0),
                         )
@@ -330,7 +323,6 @@ def kmeans_largeN_assign(
     work_streams = {}
     centroids_g = {}
     cluster_ids_g = {}
-    x_sq_cache_g = {}
     done_events = {}
     init_event = {}
 
@@ -347,7 +339,6 @@ def kmeans_largeN_assign(
             work_streams[g] = [torch.cuda.Stream(device=dev) for _ in range(buf_size)]
             n_points_g = point_end[g] - point_start[g]
             cluster_ids_g[g] = torch.empty((n_points_g,), device=dev, dtype=torch.int32)
-            x_sq_cache_g[g] = [None] * blocks_per_gpu[g]
             done_events[g] = [torch.cuda.Event() for _ in range(blocks_per_gpu[g])]
             init_event[g] = torch.cuda.Event()
 
@@ -385,9 +376,6 @@ def kmeans_largeN_assign(
 
                     x_block = x[n_start:n_end].to(dev, non_blocking=True, dtype=dtype)
 
-                    if x_sq_cache_g[g][local_idx] is None:
-                        x_sq_cache_g[g][local_idx] = (x_block ** 2).sum(dim=-1)
-
                     if local_idx > 0:
                         ws.wait_event(done_events[g][local_idx - 1])
 
@@ -397,7 +385,6 @@ def kmeans_largeN_assign(
                     euclid_assign_triton(
                         x_block.unsqueeze(0),
                         cent_g.unsqueeze(0),
-                        x_sq_cache_g[g][local_idx].unsqueeze(0),
                         out=cluster_ids_g[g][local_offset:local_end].unsqueeze(0),
                         c_sq=c_sq.unsqueeze(0),
                     )

@@ -5,9 +5,17 @@ kernel that computes nearest-centroid IDs without ever materialising the
 ``(N, K)`` cross matrix or intermediate distance matrix in HBM. The
 streaming axis is the centroid index ``K``: each CTA tile keeps its
 ``BM × BN_centroid`` cross accumulator in WGMMA registers, fuses the
-``x_sq + c_sq − 2·cross`` distance computation in registers, and updates
-a per-row running ``argmin`` across centroid tiles. Only the final
-``(BM,)`` int32 best-index vector is written to GMEM.
+``c_sq − 2·cross`` (shifted) distance computation in registers, and
+updates a per-row running ``argmin`` across centroid tiles. Only the
+final ``(BM,)`` int32 best-index vector is written to GMEM.
+
+We compute the *shifted* squared distance
+``d'[m, k] = ||y_k||² − 2·x_m·y_k`` (== ``||x − y||² − ||x||²``) and
+take its argmin over ``k``. The ``||x||²`` term is constant per row and
+so does not affect the argmin; dropping it eliminates one HBM tensor
+(``x_sq``), its precompute pass, the per-tile load, and ``M_per_thr``
+fp32 registers per consumer thread. The shifted ``d'`` can be negative,
+so the underflow clamp is also removed (it never affected argmin).
 
 The architecture borrows directly from the CUTLASS hopper FMHA reference
 (``examples/python/CuTeDSL/cute/hopper/kernel/attention/fmha.py``) and
@@ -24,13 +32,12 @@ the reference dense GEMM (``…/dense_gemm/dense_gemm.py``):
   centroid tile completes one fresh accumulator (no inter-tile carry).
 * In-register epilogue per centroid tile: convert the WGMMA acc to fp32
   (it is already fp32 if ``acc_dtype=Float32``), compute
-  ``dist = x_sq + c_sq − 2·cross`` per (m, n) acc element, clamp to ≥ 0,
-  then do a per-thread linear argmin across the BN_centroid axis. The
-  per-thread (best_dist, best_idx) is updated in-place across centroid
-  tiles. After the centroid-stream loop, a warp-shuffle bfly argmin
-  reduction across the row's WGMMA TV-layout group resolves the global
-  per-row argmin. Only the row-leader thread writes ``best_idx`` to
-  GMEM.
+  ``dist = c_sq − 2·cross`` per (m, n) acc element, then do a per-thread
+  linear argmin across the BN_centroid axis. The per-thread (best_dist,
+  best_idx) is updated in-place across centroid tiles. After the
+  centroid-stream loop, a warp-shuffle bfly argmin reduction across the
+  row's WGMMA TV-layout group resolves the global per-row argmin. Only
+  the row-leader thread writes ``best_idx`` to GMEM.
 
 The non-warp-specialised variant (this file) all warps participate in
 WGMMA; only ``warp_idx == 0`` performs TMA loads. The mbarrier-based
@@ -48,7 +55,7 @@ Constraints enforced at JIT time:
 * ``D ≤ 512`` (small-D regime; SMEM holds the full X tile). Larger D
   is dispatched to the Triton split-D kernel by the caller.
 * Input ``x`` and ``centroids`` must be ``fp16`` or ``bf16`` and share
-  dtype. ``x_sq``, ``c_sq`` are ``fp32``. ``out`` is ``int32``.
+  dtype. ``c_sq`` is ``fp32``. ``out`` is ``int32``.
 """
 from __future__ import annotations
 
@@ -190,7 +197,6 @@ class HopperFlashKmeansAssign:
         self,
         x: cute.Tensor,         # (N, D) fp16/bf16, k-major  (= "A: M×K")
         centroids: cute.Tensor, # (K, D) fp16/bf16, k-major  (= "B: N×K")
-        x_sq: cute.Tensor,      # (N,)   fp32
         c_sq: cute.Tensor,      # (K,)   fp32
         out: cute.Tensor,       # (N,)   int32
         stream: cuda.CUstream,
@@ -293,7 +299,7 @@ class HopperFlashKmeansAssign:
             self.kernel_ws(
                 tma_atom_x, tma_tensor_x,
                 tma_atom_c, tma_tensor_c,
-                x_sq, c_sq, out,
+                c_sq, out,
                 self.tiled_mma,
                 self.x_smem_layout_staged,
                 self.c_smem_layout_staged,
@@ -307,7 +313,7 @@ class HopperFlashKmeansAssign:
             self.kernel(
                 tma_atom_x, tma_tensor_x,
                 tma_atom_c, tma_tensor_c,
-                x_sq, c_sq, out,
+                c_sq, out,
                 self.tiled_mma,
                 self.x_smem_layout_staged,
                 self.c_smem_layout_staged,
@@ -329,7 +335,6 @@ class HopperFlashKmeansAssign:
         mX_nd: cute.Tensor,         # (N, D)
         tma_atom_c: cute.CopyAtom,
         mC_kd: cute.Tensor,         # (K, D)
-        mXsq_n: cute.Tensor,        # (N,)   fp32
         mCsq_k: cute.Tensor,        # (K,)   fp32
         mOut_n: cute.Tensor,        # (N,)   int32
         tiled_mma: cute.TiledMma,
@@ -520,9 +525,9 @@ class HopperFlashKmeansAssign:
                 c_producer_state.advance()
 
         # ------------------------------------------------------------
-        # Pre-load x_sq into RMEM (per-thread, indexed by acc rows it owns).
-        # Each thread holds M_per_thread acc rows and we only need x_sq
-        # for those rows. Use ptPcP[i, 0][0] to get the local m for row i.
+        # Compute per-thread acc TV layout. We don't pre-load x_sq —
+        # the argmin uses the shifted distance ``c_sq − 2·cross``
+        # which drops the constant ``||x||²`` term.
         # ------------------------------------------------------------
         acc_mn_layout = self._layout_acc_mn(tiled_mma, acc.layout)
         acc_mn = cute.make_tensor(acc.iterator, acc_mn_layout)
@@ -530,16 +535,6 @@ class HopperFlashKmeansAssign:
 
         M_per_thr = cute.size(acc_mn, mode=[0])
         N_per_thr = cute.size(acc_mn, mode=[1])
-
-        xs = cute.make_rmem_tensor(cute.make_layout(M_per_thr), cutlass.Float32)
-        for i in cutlass.range_constexpr(M_per_thr):
-            m_local = ptPcP_mn[(i, 0)][0]
-            m_global = m_local + cta_m_offset
-            # Mask OOB rows with sentinel — they won't be written anyway.
-            if m_global < N_total:
-                xs[i] = mXsq_n[m_global]
-            else:
-                xs[i] = cutlass.Float32(0.0)
 
         # Per-row running argmin (in registers, per-thread).
         best_d = cute.make_rmem_tensor(cute.make_layout(M_per_thr), cutlass.Float32)
@@ -607,9 +602,10 @@ class HopperFlashKmeansAssign:
                 c_producer_state.advance()
 
             # ------------------------------------------------------
-            # In-register epilogue: dist = x_sq + c_sq − 2·acc, then
-            # update per-thread running argmin across this tile's N_per_thr
-            # elements.
+            # In-register epilogue: dist = c_sq − 2·acc (shifted by the
+            # constant ``||x||²`` term per row; argmin is preserved).
+            # Update per-thread running argmin across this tile's
+            # N_per_thr elements.
             # ------------------------------------------------------
             cta_n_offset = c_tile_idx * BN
 
@@ -627,12 +623,9 @@ class HopperFlashKmeansAssign:
             for i in cutlass.range_constexpr(M_per_thr):
                 bd = best_d[i]
                 bi = best_i[i]
-                xsi = xs[i]
                 for j in cutlass.range_constexpr(N_per_thr):
                     cross = acc_mn[(i, j)]
-                    dist = xsi + cs[j] - cutlass.Float32(2.0) * cross
-                    if dist < cutlass.Float32(0.0):
-                        dist = cutlass.Float32(0.0)
+                    dist = cs[j] - cutlass.Float32(2.0) * cross
                     n_local = ptPcP_mn[(i, j)][1]
                     n_global = n_local + cta_n_offset
                     # OOB centroid columns are masked via cs[j]=+inf above,
@@ -697,7 +690,6 @@ class HopperFlashKmeansAssign:
         mX_nd: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_kd: cute.Tensor,
-        mXsq_n: cute.Tensor,
         mCsq_k: cute.Tensor,
         mOut_n: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -883,16 +875,8 @@ class HopperFlashKmeansAssign:
             M_per_thr = cute.size(acc_mn, mode=[0])
             N_per_thr = cute.size(acc_mn, mode=[1])
 
-            # Pre-load x_sq for the M rows this thread owns.
-            xs = cute.make_rmem_tensor(cute.make_layout(M_per_thr), cutlass.Float32)
-            for i in cutlass.range_constexpr(M_per_thr):
-                m_local = ptPcP_mn[(i, 0)][0]
-                m_global = m_local + cta_m_offset
-                if m_global < N_total:
-                    xs[i] = mXsq_n[m_global]
-                else:
-                    xs[i] = cutlass.Float32(0.0)
-
+            # No x_sq preload — argmin uses the shifted distance
+            # ``c_sq − 2·cross`` which drops the constant ``||x||²``.
             best_d = cute.make_rmem_tensor(cute.make_layout(M_per_thr), cutlass.Float32)
             best_i = cute.make_rmem_tensor(cute.make_layout(M_per_thr), cutlass.Int32)
             for i in cutlass.range_constexpr(M_per_thr):
@@ -947,12 +931,9 @@ class HopperFlashKmeansAssign:
                 for i in cutlass.range_constexpr(M_per_thr):
                     bd = best_d[i]
                     bi = best_i[i]
-                    xsi = xs[i]
                     for j in cutlass.range_constexpr(N_per_thr):
                         cross = acc_mn[(i, j)]
-                        dist = xsi + cs[j] - cutlass.Float32(2.0) * cross
-                        if dist < cutlass.Float32(0.0):
-                            dist = cutlass.Float32(0.0)
+                        dist = cs[j] - cutlass.Float32(2.0) * cross
                         n_local = ptPcP_mn[(i, j)][1]
                         n_global = n_local + cta_n_offset
                         if dist < bd:

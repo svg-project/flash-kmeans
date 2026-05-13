@@ -1,0 +1,57 @@
+Launching GPU 4 -> scripts/tune_results/tune_cutedsl_g4.json
+Launching GPU 5 -> scripts/tune_results/tune_cutedsl_g5.json
+Launching GPU 6 -> scripts/tune_results/tune_cutedsl_g6.json
+Launching GPU 7 -> scripts/tune_results/tune_cutedsl_g7.json
+Worker shard=0/4 cells=12 (of 48)  out=scripts/tune_results/tune_cutedsl_g4.json
+Worker shard=1/4 cells=12 (of 48)  out=scripts/tune_results/tune_cutedsl_g5.json
+Worker shard=3/4 cells=12 (of 48)  out=scripts/tune_results/tune_cutedsl_g7.json
+Worker shard=2/4 cells=12 (of 48)  out=scripts/tune_results/tune_cutedsl_g6.json
+[1/12] N=65536 K=256 D=64 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': False} (12.7 us)  cell_time=12.8s  elapsed=12.8s
+[1/12] N=1048576 K=256 D=64 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (104.5 us)  cell_time=12.8s  elapsed=12.8s
+[1/12] N=1048576 K=256 D=64 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (103.1 us)  cell_time=12.8s  elapsed=12.8s
+[1/12] N=65536 K=256 D=64 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (12.0 us)  cell_time=12.9s  elapsed=12.9s
+[2/12] N=65536 K=4096 D=64 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (107.0 us)  cell_time=9.0s  elapsed=21.8s
+[2/12] N=65536 K=4096 D=64 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (107.5 us)  cell_time=8.9s  elapsed=21.8s
+[2/12] N=1048576 K=4096 D=64 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (1465.9 us)  cell_time=9.2s  elapsed=22.0s
+[2/12] N=1048576 K=4096 D=64 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (1451.7 us)  cell_time=9.2s  elapsed=22.1s
+[3/12] N=65536 K=65536 D=64 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (1662.1 us)  cell_time=9.3s  elapsed=31.1s
+[3/12] N=65536 K=65536 D=64 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (1659.7 us)  cell_time=9.3s  elapsed=31.1s
+[3/12] N=1048576 K=65536 D=64 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (24394.4 us)  cell_time=13.9s  elapsed=35.9s
+[3/12] N=1048576 K=65536 D=64 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (24291.2 us)  cell_time=13.9s  elapsed=35.9s
+[4/12] N=65536 K=256 D=128 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (16.4 us)  cell_time=9.4s  elapsed=40.5s
+[4/12] N=65536 K=256 D=128 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (16.1 us)  cell_time=9.4s  elapsed=40.5s
+[4/12] N=1048576 K=256 D=128 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (164.7 us)  cell_time=9.4s  elapsed=45.3s
+[4/12] N=1048576 K=256 D=128 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (166.1 us)  cell_time=9.4s  elapsed=45.4s
+[5/12] N=65536 K=4096 D=128 dt=bf16: best={'BM': 128, 'BN': 256, 'use_ws': False} (137.7 us)  cell_time=9.7s  elapsed=50.1s
+[5/12] N=65536 K=4096 D=128 dt=fp16: best={'BM': 128, 'BN': 256, 'use_ws': False} (138.4 us)  cell_time=9.7s  elapsed=50.2s
+[5/12] N=1048576 K=4096 D=128 dt=bf16: best={'BM': 128, 'BN': 256, 'use_ws': False} (2002.7 us)  cell_time=10.0s  elapsed=55.4s
+[5/12] N=1048576 K=4096 D=128 dt=fp16: best={'BM': 128, 'BN': 256, 'use_ws': False} (2003.5 us)  cell_time=10.1s  elapsed=55.4s
+[6/12] N=65536 K=65536 D=128 dt=bf16: best={'BM': 128, 'BN': 256, 'use_ws': False} (2052.5 us)  cell_time=10.2s  elapsed=60.3s
+[6/12] N=65536 K=65536 D=128 dt=fp16: best={'BM': 128, 'BN': 256, 'use_ws': False} (2051.0 us)  cell_time=10.2s  elapsed=60.4s
+[7/12] N=65536 K=256 D=256 dt=bf16: best={'BM': 128, 'BN': 256, 'use_ws': False} (28.1 us)  cell_time=11.0s  elapsed=71.3s
+[7/12] N=65536 K=256 D=256 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': False} (27.9 us)  cell_time=11.0s  elapsed=71.4s
+[6/12] N=1048576 K=65536 D=128 dt=bf16: best={'BM': 128, 'BN': 256, 'use_ws': False} (35292.2 us)  cell_time=17.6s  elapsed=73.0s
+[6/12] N=1048576 K=65536 D=128 dt=fp16: best={'BM': 128, 'BN': 256, 'use_ws': False} (35109.6 us)  cell_time=17.6s  elapsed=73.0s
+[8/12] N=65536 K=4096 D=256 dt=bf16: best={'BM': 128, 'BN': 128, 'use_ws': True} (214.9 us)  cell_time=11.4s  elapsed=82.7s
+[8/12] N=65536 K=4096 D=256 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': True} (216.4 us)  cell_time=11.4s  elapsed=82.9s
+[7/12] N=1048576 K=256 D=256 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': False} (349.2 us)  cell_time=11.1s  elapsed=84.1s
+[7/12] N=1048576 K=256 D=256 dt=bf16: best={'BM': 128, 'BN': 128, 'use_ws': False} (348.2 us)  cell_time=11.1s  elapsed=84.1s
+[9/12] N=65536 K=65536 D=256 dt=bf16: best={'BM': 128, 'BN': 128, 'use_ws': True} (3981.7 us)  cell_time=12.4s  elapsed=95.1s
+[9/12] N=65536 K=65536 D=256 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': True} (3985.1 us)  cell_time=12.5s  elapsed=95.3s
+[8/12] N=1048576 K=4096 D=256 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': True} (3214.8 us)  cell_time=12.1s  elapsed=96.2s
+[8/12] N=1048576 K=4096 D=256 dt=bf16: best={'BM': 128, 'BN': 128, 'use_ws': True} (3303.4 us)  cell_time=12.1s  elapsed=96.2s
+[10/12] N=65536 K=256 D=512 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (53.7 us)  cell_time=5.1s  elapsed=100.3s
+[10/12] N=65536 K=256 D=512 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (53.2 us)  cell_time=5.2s  elapsed=100.5s
+[11/12] N=65536 K=4096 D=512 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': True} (542.3 us)  cell_time=5.2s  elapsed=105.4s
+[11/12] N=65536 K=4096 D=512 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': True} (546.1 us)  cell_time=5.2s  elapsed=105.6s
+[12/12] N=65536 K=65536 D=512 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (9673.6 us)  cell_time=6.0s  elapsed=111.4s
+[12/12] N=65536 K=65536 D=512 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (9742.5 us)  cell_time=6.0s  elapsed=111.7s
+[9/12] N=1048576 K=65536 D=256 dt=bf16: best={'BM': 128, 'BN': 128, 'use_ws': True} (63893.9 us)  cell_time=27.8s  elapsed=124.0s
+[9/12] N=1048576 K=65536 D=256 dt=fp16: best={'BM': 128, 'BN': 128, 'use_ws': True} (63822.5 us)  cell_time=27.8s  elapsed=124.0s
+[10/12] N=1048576 K=256 D=512 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': True} (678.7 us)  cell_time=5.2s  elapsed=129.2s
+[10/12] N=1048576 K=256 D=512 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': True} (676.2 us)  cell_time=5.2s  elapsed=129.2s
+[11/12] N=1048576 K=4096 D=512 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': True} (8070.9 us)  cell_time=5.8s  elapsed=135.0s
+[11/12] N=1048576 K=4096 D=512 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': True} (8089.6 us)  cell_time=5.8s  elapsed=135.1s
+[12/12] N=1048576 K=65536 D=512 dt=bf16: best={'BM': 128, 'BN': 64, 'use_ws': False} (153159.2 us)  cell_time=18.9s  elapsed=153.9s
+[12/12] N=1048576 K=65536 D=512 dt=fp16: best={'BM': 128, 'BN': 64, 'use_ws': False} (154426.6 us)  cell_time=19.0s  elapsed=154.1s
+Merged 48 cells -> scripts/tune_results/tune_cutedsl_h200.json

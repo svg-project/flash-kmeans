@@ -27,8 +27,9 @@ _DTYPES = {
 }
 
 
-def _torch_ref_argmin(x: torch.Tensor, cents: torch.Tensor, x_sq: torch.Tensor) -> torch.Tensor:
+def _torch_ref_argmin(x: torch.Tensor, cents: torch.Tensor) -> torch.Tensor:
     cross = (x.float() @ cents.float().T)
+    x_sq = (x.float() ** 2).sum(-1)
     c_sq = (cents.float() ** 2).sum(-1)
     dist = (x_sq[:, None] + c_sq[None, :] - 2.0 * cross).clamp_min_(0.0)
     return dist.argmin(-1).to(torch.int32)
@@ -82,12 +83,11 @@ def correctness_sweep():
         torch.manual_seed(0)
         x = torch.randn(1, N, D, device="cuda", dtype=dtype)
         cents = torch.randn(1, K, D, device="cuda", dtype=dtype)
-        x_sq = (x.float() ** 2).sum(-1)
 
-        out_cute = cutedsl_assign_euclid(x, cents, x_sq)
-        out_tri = euclid_assign_triton(x, cents, x_sq)
+        out_cute = cutedsl_assign_euclid(x, cents)
+        out_tri = euclid_assign_triton(x, cents)
 
-        ref = _torch_ref_argmin(x.view(N, D), cents.view(K, D), x_sq.view(N))
+        ref = _torch_ref_argmin(x.view(N, D), cents.view(K, D))
 
         cute_match = (out_cute.view(-1) == ref).float().mean().item()
         tri_match = (out_tri.view(-1) == ref).float().mean().item()
@@ -132,14 +132,13 @@ def bench_assign():
     for N, D, K in shapes:
         x = torch.randn(1, N, D, device="cuda", dtype=torch.bfloat16)
         cents = torch.randn(1, K, D, device="cuda", dtype=torch.bfloat16)
-        x_sq = (x.float() ** 2).sum(-1)
         c_sq = (cents.float() ** 2).sum(-1).view(K).contiguous()
         out = torch.empty((1, N), device="cuda", dtype=torch.int32)
 
         # Pass pre-computed c_sq to both paths to keep the comparison fair —
         # the Lloyd loop also caches c_sq across iterations.
-        t_tri = _bench(lambda: euclid_assign_triton(x, cents, x_sq, out=out, c_sq=c_sq.view(1, K)))
-        t_cute = _bench(lambda: cutedsl_assign_euclid(x, cents, x_sq, out=out, c_sq=c_sq))
+        t_tri = _bench(lambda: euclid_assign_triton(x, cents, out=out, c_sq=c_sq.view(1, K)))
+        t_cute = _bench(lambda: cutedsl_assign_euclid(x, cents, out=out, c_sq=c_sq))
         print(f"N={N:<8} D={D:<5} K={K:<5}      {t_tri:>13.1f} {t_cute:>15.1f} {t_tri/t_cute:>10.2f}x")
 
 
@@ -157,11 +156,10 @@ def bench_kernel_only(N: int, D: int, K: int, dtype_s: str, bm: int, bn: int, re
     torch.manual_seed(0)
     x = torch.randn(N, D, device="cuda", dtype=dtype).contiguous()
     cents = torch.randn(K, D, device="cuda", dtype=dtype).contiguous()
-    x_sq = (x.float() ** 2).sum(-1).contiguous()
     c_sq = (cents.float() ** 2).sum(-1).contiguous()
     out = torch.empty(N, device="cuda", dtype=torch.int32)
 
-    ref = _torch_ref_argmin(x, cents, x_sq)
+    ref = _torch_ref_argmin(x, cents)
 
     kernel = HopperFlashKmeansAssign(
         acc_dtype=cutlass.Float32, m_block_size=bm, n_block_size=bn,
@@ -172,7 +170,7 @@ def bench_kernel_only(N: int, D: int, K: int, dtype_s: str, bm: int, bn: int, re
     compiled = cute.compile(
         kernel,
         from_dlpack(x), from_dlpack(cents),
-        from_dlpack(x_sq), from_dlpack(c_sq), from_dlpack(out),
+        from_dlpack(c_sq), from_dlpack(out),
         stream,
     )
     print(f"Compile took {time.time() - t0:.2f}s")
@@ -180,7 +178,7 @@ def bench_kernel_only(N: int, D: int, K: int, dtype_s: str, bm: int, bn: int, re
     out.zero_()
     compiled(
         from_dlpack(x), from_dlpack(cents),
-        from_dlpack(x_sq), from_dlpack(c_sq), from_dlpack(out),
+        from_dlpack(c_sq), from_dlpack(out),
         stream,
     )
     torch.cuda.synchronize()
@@ -190,7 +188,7 @@ def bench_kernel_only(N: int, D: int, K: int, dtype_s: str, bm: int, bn: int, re
     t = _bench(
         lambda: compiled(
             from_dlpack(x), from_dlpack(cents),
-            from_dlpack(x_sq), from_dlpack(c_sq), from_dlpack(out),
+            from_dlpack(c_sq), from_dlpack(out),
             stream,
         ),
         repeats=repeats,

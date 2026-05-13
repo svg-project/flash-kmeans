@@ -14,9 +14,9 @@ from tqdm import trange
 # -------------------- Compiled single-iteration kernels --------------------
 
 # 1. Euclidean
-def _euclid_iter(x, x_sq, centroids, use_heuristic=True):
+def _euclid_iter(x, centroids, use_heuristic=True):
     
-    cluster_ids = euclid_assign_triton(x, centroids, x_sq, use_heuristic=use_heuristic)
+    cluster_ids = euclid_assign_triton(x, centroids, use_heuristic=use_heuristic)
     centroids_new = triton_centroid_update_sorted_euclid(x, cluster_ids, centroids)
 
     shift = (centroids_new - centroids).norm(dim=-1).max()
@@ -89,9 +89,6 @@ def batch_kmeans_Euclid(
     B, N, D = x.shape
     K = n_clusters
 
-    # Pre-compute squared L2 norm of all points (constant during iterations)
-    x_sq = (x ** 2).sum(dim=-1)  # (B, N)
-
     if init_centroids is None:
         # Randomly select initial centers from x
         indices = torch.randint(0, N, (B, K), device=x.device)
@@ -109,7 +106,7 @@ def batch_kmeans_Euclid(
         # ----- legacy path: per-iter alloc + .clone() -----
         for it in range(max_iters):
             centroids_new, center_shift, cluster_ids = _euclid_iter_compiled(
-                x, x_sq, centroids, use_heuristic
+                x, centroids, use_heuristic
             )
             if verbose:
                 print(f"Iter {it}, center shift: {center_shift.item():.6f}")
@@ -131,7 +128,7 @@ def batch_kmeans_Euclid(
     cluster_ids = None
     it = 0
     for it in range(max_iters):
-        cluster_ids = euclid_assign_triton(x, cur, x_sq, use_heuristic=use_heuristic)
+        cluster_ids = euclid_assign_triton(x, cur, use_heuristic=use_heuristic)
         # writes new centroids into `nxt`, returns scalar GPU tensor for shift
         new_cent, _, max_shift = triton_lloyd_centroid_step_euclid(
             x, cluster_ids, cur,

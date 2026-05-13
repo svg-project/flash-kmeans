@@ -1,0 +1,30 @@
+[
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 1024,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 32,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 2278.7776947021484
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 1024,
+    "dtype": "fp32",
+    "best": {
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "BLOCK_D": 64,
+      "num_warps": 4,
+      "num_stages": 4
+    },
+    "time_us": 38344.9462890625
+  }
+]

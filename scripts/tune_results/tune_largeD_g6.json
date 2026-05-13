@@ -1,0 +1,44 @@
+[
+  {
+    "N": 1048576,
+    "K": 256,
+    "D": 1024,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 64,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 1060.2304458618164
+  },
+  {
+    "N": 1048576,
+    "K": 4096,
+    "D": 1024,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 64,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 17150.613403320312
+  },
+  {
+    "N": 1048576,
+    "K": 65536,
+    "D": 1024,
+    "dtype": "fp16",
+    "best": {
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "BLOCK_D": 64,
+      "num_warps": 8,
+      "num_stages": 4
+    },
+    "time_us": 277923.6572265625
+  }
+]

@@ -236,18 +236,15 @@ class FlashKMeans:
         # Prepare tensors for kernel call
         compute_dtype = self.dtype or x_b.dtype 
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
- 
-        x_sq = (x_b ** 2).sum(dim=-1)
 
         if self.use_triton:
             # Call Triton assignment kernel
-            labels_b = euclid_assign_triton(x_b, self.centroids_b, x_sq)
+            labels_b = euclid_assign_triton(x_b, self.centroids_b)
         else:
             # Call PyTorch assignment fallback
             labels_b = euclid_assign_torch_native_chunked(
                 x_b,
                 self.centroids_b,
-                x_sq,
                 chunk_size_N=self.chunk_size_data,
                 chunk_size_K=self.chunk_size_centroids,
             )
