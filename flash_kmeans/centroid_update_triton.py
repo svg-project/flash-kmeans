@@ -24,6 +24,46 @@ def _pad_d(D: int) -> int:
     return max(16, _next_pow2(D))
 
 
+def _dtype_bytes(dtype) -> int:
+    """Element size in bytes for a torch dtype (fallback 4 for the unknown)."""
+    if isinstance(dtype, torch.dtype):
+        return torch.tensor([], dtype=dtype).element_size()
+    if isinstance(dtype, int):
+        return dtype
+    return 4
+
+
+# Per-program feature-tile budget (bytes) for the chunk kernel. The kernel
+# materialises a ``[BLOCK_N, BLOCK_D]`` feature tile in registers/local memory
+# for each cluster run; capping its byte size keeps the driver's per-launch
+# local-memory scratch bounded. Without this cap a large D combined with a
+# wide dtype (fp32/fp64) forces a huge ``[BLOCK_N, next_pow2(D)]`` tile that
+# spills heavily and can fail ``cuLaunchKernel`` with CUDA OOM (issue #19).
+# 256 KiB per program keeps D<=512 (all dtypes) and D<=1024 (fp16) in a single
+# D pass -- byte-for-byte identical to the pre-split-D kernel -- while tiling
+# only the genuinely large tiles that used to spill.
+_CHUNK_TILE_BUDGET_BYTES = 256 * 1024
+
+
+def _choose_block_d(D: int, BLOCK_N: int, dtype_bytes: int,
+                    budget_bytes: int = _CHUNK_TILE_BUDGET_BYTES) -> int:
+    """Pick the feature-dim tile ``BLOCK_D`` for ``_centroid_update_chunk_kernel``.
+
+    Returns ``_pad_d(D)`` (a single D pass, identical to the original kernel)
+    whenever the full padded feature vector fits the per-program tile budget.
+    Otherwise returns the largest power-of-two ``BLOCK_D`` (>= 16) whose
+    ``[BLOCK_N, BLOCK_D]`` tile fits the budget, so the inner D loop keeps the
+    register/local-memory footprint bounded regardless of D or dtype.
+    """
+    D_pad = _pad_d(D)
+    if BLOCK_N * D_pad * dtype_bytes <= budget_bytes:
+        return D_pad
+    bd = D_pad
+    while bd > 16 and BLOCK_N * bd * dtype_bytes > budget_bytes:
+        bd //= 2
+    return max(bd, 16)
+
+
 @triton.jit
 def _centroid_update_kernel(
     x_ptr,                # *f16 / *f32 [B, N, D]
@@ -201,7 +241,7 @@ def _centroid_update_chunk_kernel(
     D: tl.constexpr,
     K: tl.constexpr,
     BLOCK_N: tl.constexpr,   # how many tokens (points) each program processes
-    D_PAD: tl.constexpr,     # next pow2 >= D (min 16); tail [D, D_PAD) is masked
+    BLOCK_D: tl.constexpr,   # feature-dim tile; inner loop streams D in BLOCK_D chunks
 ):
     """Each program processes **BLOCK_N consecutive, already-sorted tokens**.
 
@@ -209,6 +249,14 @@ def _centroid_update_chunk_kernel(
     contiguous runs.  We therefore accumulate a local sum/count for the
     current run and perform **a single atomic update per run**, instead of
     per-token.
+
+    The feature dimension is streamed in ``BLOCK_D`` chunks (split-D), so the
+    per-program ``[BLOCK_N, BLOCK_D]`` tile — and therefore the register /
+    local-memory footprint — is bounded by ``BLOCK_D`` rather than D. This
+    avoids the launch-time OOM that the old single-tile ``[BLOCK_N, next_pow2(D)]``
+    load hit for large D + wide dtypes (issue #19), and drops the
+    next-power-of-two padding waste (the inner loop iterates over the real D and
+    masks only the final partial tile).
     """
     # program indices – 2-D launch grid: (chunk_id, batch_id)
     pid_chunk = tl.program_id(axis=0)
@@ -226,11 +274,11 @@ def _centroid_update_chunk_kernel(
     cid_batch_base     = sorted_cluster_ptr + b * stride_cluster_b
     x_batch_base       = x_ptr + b * stride_x_b  # for pointer arithmetic
 
-    # helper aranges. ``offs_dim`` covers D_PAD lanes; ``d_mask`` zeros the
-    # padded tail so non-power-of-two D works without OOB loads/stores.
     offs_token = tl.arange(0, BLOCK_N).to(tl.int64)
-    offs_dim   = tl.arange(0, D_PAD).to(tl.int64)
-    d_mask     = offs_dim < D
+    # Hoisted feature-lane base; the (constexpr) d_start offset is added per
+    # D-tile below. Keeping the arange out of the runtime cluster loop avoids
+    # rebuilding it every iteration (matters for the single-pass small-D case).
+    base_dim   = tl.arange(0, BLOCK_D).to(tl.int64)
 
     # first token index & validity mask
     token_idx  = chunk_start + offs_token
@@ -250,17 +298,20 @@ def _centroid_update_chunk_kernel(
         cluster_mask = all_ids == cid
         cluster_size = tl.sum(cluster_mask.to(tl.int32))
         if cluster_size != 0:
-            row_ptrs = x_batch_base + all_tokens_idxs[:,None]*stride_x_n + offs_dim[None,:]*stride_x_d
-            cluster_feats = tl.load(
-                row_ptrs,
-                mask=cluster_mask[:,None] & d_mask[None,:],
-                other=0.0,
-            ) # [BLOCK_N, D_PAD]
-            cluster_feats = cluster_feats.to(tl.float32)
-            sum_feats = tl.sum(cluster_feats, axis=0)
-            dest_ptr = sum_ptr + b*stride_sum_b + cid*stride_sum_k + offs_dim*stride_sum_d
-            tl.atomic_add(dest_ptr, sum_feats, mask=d_mask)
-            tl.atomic_add(count_ptr + b*stride_count_b + cid*stride_count_k, cluster_size)
+            for d_start in range(0, D, BLOCK_D):
+                offs_dim = d_start + base_dim
+                d_mask = offs_dim < D
+                row_ptrs = x_batch_base + all_tokens_idxs[:, None] * stride_x_n + offs_dim[None, :] * stride_x_d
+                cluster_feats = tl.load(
+                    row_ptrs,
+                    mask=cluster_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )  # [BLOCK_N, BLOCK_D]
+                cluster_feats = cluster_feats.to(tl.float32)
+                sum_feats = tl.sum(cluster_feats, axis=0)  # [BLOCK_D]
+                dest_ptr = sum_ptr + b * stride_sum_b + cid * stride_sum_k + offs_dim * stride_sum_d
+                tl.atomic_add(dest_ptr, sum_feats, mask=d_mask)
+            tl.atomic_add(count_ptr + b * stride_count_b + cid * stride_count_k, cluster_size)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -301,7 +352,7 @@ def triton_centroid_update_sorted_cosine(x_norm: torch.Tensor, cluster_ids: torc
         centroid_cnts.stride(0), centroid_cnts.stride(1),
         B, N, D, K,
         BLOCK_N=BLOCK_N,
-        D_PAD=_pad_d(D),
+        BLOCK_D=_choose_block_d(D, BLOCK_N, _dtype_bytes(x_norm.dtype)),
     )
 
     # finalise – convert to means, handle empty clusters, renormalise
@@ -372,7 +423,7 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
         centroid_cnts.stride(0), centroid_cnts.stride(1),
         B, N, D, K,
         BLOCK_N=BLOCK_N,
-        D_PAD=_pad_d(D),
+        BLOCK_D=_choose_block_d(D, BLOCK_N, _dtype_bytes(x.dtype)),
     )
 
     if calculate_new:
