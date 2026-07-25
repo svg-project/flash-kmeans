@@ -277,9 +277,13 @@ def scalable_kmeans_pp(x, n_clusters, x_sq=None, weights=None,
         )
 
     # --- Step 5: reduce C candidates to K centroids ---
-    # Weighted sequential kmeans++ on candidates (matches cuml's reduction)
+    # Greedy weighted kmeans++ on candidates (matches cuml's reduction). The
+    # greedy local-trials variant is used (not plain sequential) so the final
+    # reduction is as robust as standard_kmeans_pp; a plain reduction
+    # occasionally picks two candidates from one cluster and leaves another
+    # uncovered, producing rare but severe quality blow-ups.
     cand_sq = (all_candidates.float() ** 2).sum(-1)
-    return _kmeanspp_sequential(all_candidates, n_clusters, cand_sq, weights=cand_weights)
+    return standard_kmeans_pp(all_candidates, n_clusters, cand_sq, weights=cand_weights)
 
 
 def euclid_assign_torch_native_chunked(x, centroids, x_sq, chunk_size_N=32768, chunk_size_K=1024):
