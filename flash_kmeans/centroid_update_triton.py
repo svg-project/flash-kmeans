@@ -440,6 +440,181 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
 # ------------------------------ END new implementation ------------------------------
 
 
+@triton.jit
+def _centroid_update_chunk_weighted_kernel(
+    x_ptr,                # *f16 / *f32 [B, N, D] – ORIGINAL ORDER
+    sorted_idx_ptr,       # *i32        [B, N]
+    sorted_cluster_ptr,   # *i32        [B, N]
+    weight_ptr,           # *f32        [B, N] – per-point weights in ORIGINAL order
+    sum_ptr,              # *f32        [B, K, D]
+    weight_sum_ptr,       # *f32        [B, K]
+    # strides
+    stride_x_b, stride_x_n, stride_x_d,
+    stride_idx_b, stride_idx_n, stride_cluster_b, stride_cluster_n,
+    stride_w_b, stride_w_n,
+    stride_sum_b, stride_sum_k, stride_sum_d,
+    stride_ws_b, stride_ws_k,
+    B: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Weighted variant of _centroid_update_chunk_kernel.
+
+    Multiplies features by per-point weight inside the kernel to avoid
+    materialising a full weighted-data copy on the host side.
+    Accumulates float32 weight sums instead of int counts.
+
+    The feature dimension is streamed in ``BLOCK_D`` chunks (split-D, matching
+    ``_centroid_update_chunk_kernel``), so the per-program ``[BLOCK_N, BLOCK_D]``
+    tile is bounded regardless of D or dtype, and non-power-of-two D is handled
+    by masking the final partial tile rather than requiring a power-of-two
+    ``tl.arange(0, D)``.
+    """
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    flat_id = tl.program_id(axis=0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b     = flat_id // n_tiles
+    pid_chunk = flat_id % n_tiles
+
+    b = pid_b.to(tl.int64)
+    chunk_start = (pid_chunk * BLOCK_N).to(tl.int64)
+
+    if chunk_start >= N:
+        return
+
+    idx_batch_base = sorted_idx_ptr + b * stride_idx_b
+    cid_batch_base = sorted_cluster_ptr + b * stride_cluster_b
+    x_batch_base   = x_ptr + b * stride_x_b
+    w_batch_base   = weight_ptr + b * stride_w_b
+
+    offs_token = tl.arange(0, BLOCK_N).to(tl.int64)
+    # Hoisted feature-lane base; the (constexpr) d_start offset is added per
+    # D-tile below (see _centroid_update_chunk_kernel).
+    base_dim   = tl.arange(0, BLOCK_D).to(tl.int64)
+
+    token_idx  = chunk_start + offs_token
+    valid_tok  = token_idx < N
+    first_token_idx = chunk_start
+    last_token_idx  = tl.minimum(chunk_start + BLOCK_N, N) - 1
+
+    first_id = tl.load(cid_batch_base + first_token_idx)
+    last_id  = tl.load(cid_batch_base + last_token_idx)
+    all_ids  = tl.load(cid_batch_base + token_idx * stride_cluster_n,
+                       mask=valid_tok, other=-1)
+
+    all_tokens_idxs = tl.load(idx_batch_base + token_idx * stride_idx_n,
+                              mask=valid_tok, other=-1)
+    all_tokens_idxs = all_tokens_idxs.to(tl.int64)
+
+    # Load per-point weights (original order) once for the whole chunk
+    all_weights = tl.load(w_batch_base + all_tokens_idxs * stride_w_n,
+                          mask=valid_tok, other=0.0)
+    all_weights = all_weights.to(tl.float32)
+
+    for cid in range(first_id, last_id + 1):
+        cluster_mask = all_ids == cid
+        cluster_size = tl.sum(cluster_mask.to(tl.int32))
+        if cluster_size != 0:
+            # Per-token weights for this cluster (D-independent; computed once).
+            cluster_weights = tl.where(cluster_mask, all_weights, 0.0)
+            for d_start in range(0, D, BLOCK_D):
+                offs_dim = d_start + base_dim
+                d_mask = offs_dim < D
+                row_ptrs = (x_batch_base
+                            + all_tokens_idxs[:, None] * stride_x_n
+                            + offs_dim[None, :] * stride_x_d)
+                cluster_feats = tl.load(
+                    row_ptrs,
+                    mask=cluster_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )  # [BLOCK_N, BLOCK_D]
+                cluster_feats = cluster_feats.to(tl.float32)
+
+                weighted_feats = cluster_feats * cluster_weights[:, None]
+                sum_feats = tl.sum(weighted_feats, axis=0)  # [BLOCK_D]
+
+                dest_ptr = (sum_ptr + b * stride_sum_b
+                            + cid * stride_sum_k + offs_dim * stride_sum_d)
+                tl.atomic_add(dest_ptr, sum_feats, mask=d_mask)
+
+            w_sum = tl.sum(cluster_weights)
+            tl.atomic_add(weight_sum_ptr + b * stride_ws_b
+                          + cid * stride_ws_k, w_sum)
+
+
+def triton_centroid_update_sorted_euclid_weighted(
+    x: torch.Tensor,
+    cluster_ids: torch.Tensor,
+    old_centroids: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    BLOCK_N: int = 256,
+):
+    """Weighted centroid update using a dedicated Triton kernel.
+
+    Avoids materialising a full weighted-data copy by multiplying features
+    by per-point weights inside the kernel.  Also eliminates the
+    fp16->fp32->fp16->fp32 precision round-trip of the old approach.
+
+    Parameters
+    ----------
+    x : Tensor [B, N, D]
+        Input feature vectors.
+    cluster_ids : LongTensor [B, N]
+        Cluster assignment for each point.
+    old_centroids : Tensor [B, K, D]
+        Previous centroids (used to fill empty clusters).
+    weights : Tensor [B, N]
+        Per-sample weights (positive).
+    """
+    assert x.is_cuda and cluster_ids.is_cuda and weights.is_cuda
+    B, N, D = x.shape
+    K = old_centroids.shape[1]
+
+    sorted_cluster_ids, sorted_idx = torch.sort(cluster_ids, dim=-1)
+    sorted_idx_int = sorted_idx.to(torch.int32)
+
+    centroid_sums = torch.zeros((B, K, D), device=x.device, dtype=torch.float32)
+    weight_sums   = torch.zeros((B, K),    device=x.device, dtype=torch.float32)
+    weights_f32   = weights.float()
+
+    grid = (B * triton.cdiv(N, BLOCK_N),)
+    _centroid_update_chunk_weighted_kernel[grid](
+        x,
+        sorted_idx_int,
+        sorted_cluster_ids.to(torch.int32),
+        weights_f32,
+        centroid_sums,
+        weight_sums,
+        x.stride(0), x.stride(1), x.stride(2),
+        sorted_idx_int.stride(0), sorted_idx_int.stride(1),
+        sorted_cluster_ids.stride(0), sorted_cluster_ids.stride(1),
+        weights_f32.stride(0), weights_f32.stride(1),
+        centroid_sums.stride(0), centroid_sums.stride(1), centroid_sums.stride(2),
+        weight_sums.stride(0), weight_sums.stride(1),
+        B, N, D, K,
+        BLOCK_N=BLOCK_N,
+        # The weighted kernel keeps two fp32 [BLOCK_N, BLOCK_D] tiles live at once
+        # (cluster_feats and cluster_feats * weights), vs one in the unweighted
+        # kernel, so it needs a tighter per-tile budget to avoid spilling. A
+        # quarter of the shared budget caps BLOCK_D at 128 for D=256 fp16, which
+        # matches the unweighted kernel's throughput (a full-D tile is ~2x slower).
+        BLOCK_D=_choose_block_d(
+            D, BLOCK_N, _dtype_bytes(x.dtype),
+            budget_bytes=_CHUNK_TILE_BUDGET_BYTES // 4,
+        ),
+    )
+
+    centroids = centroid_sums / weight_sums.unsqueeze(-1).clamp(min=1e-8)
+    empty_mask = (weight_sums == 0).unsqueeze(-1)
+    centroids = torch.where(empty_mask, old_centroids.float(), centroids)
+
+    return centroids.to(x.dtype)
+
+
 def main():
     torch.manual_seed(0)
 
