@@ -960,8 +960,14 @@ def _euclid_assign_kernel_split_d(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    # grid.x limit is 2^31-1, handles both big-B and big-N cases. The
+    # block->(b, tile) linearization matches the old 2D grid (b*n_tiles + tile),
+    # since CUDA enumerates grid.x fastest, so per-program work is unchanged.
+    flat_id = tl.program_id(0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b = (flat_id // n_tiles)
+    pid_n = (flat_id % n_tiles)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -1169,8 +1175,14 @@ def _cosine_assign_kernel_split_d(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    # grid.x limit is 2^31-1, handles both big-B and big-N cases. The
+    # block->(b, tile) linearization matches the old 2D grid (b*n_tiles + tile),
+    # since CUDA enumerates grid.x fastest, so per-program work is unchanged.
+    flat_id = tl.program_id(0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b = (flat_id // n_tiles)
+    pid_n = (flat_id % n_tiles)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -1298,10 +1310,9 @@ def euclid_assign_triton(
     stride_out_b, stride_out_n = out.stride()
 
     grid = lambda META: (B * triton.cdiv(N, META["BLOCK_N"]),)
-    # split-D kernels decode a 2D grid (program_id(0)=N-tile, program_id(1)=batch),
-    # so they keep the 2D launch; the flattened-grid fix only applies to the
-    # non-split kernels above.
-    grid_split_d = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    # split-D kernels now decode the same 1D flattened grid (B * n_tiles,) and
+    # recover (b, tile) from program_id(0), so they also launch for B > 65535.
+    grid_split_d = grid
 
     use_split_d = _need_split_d(D, x.dtype, x.device)
 
@@ -1456,8 +1467,8 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
     stride_out_b, stride_out_n = out.stride()
 
     grid = lambda META: (B * triton.cdiv(N, META["BLOCK_N"]),)
-    # split-D kernel decodes a 2D grid; keep its 2D launch (see euclid path).
-    grid_split_d = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    # split-D kernel decodes the same 1D flattened grid (see euclid path).
+    grid_split_d = grid
 
     if _need_split_d(D, x.dtype, x.device):
         _cosine_assign_kernel_split_d_autotuned[grid_split_d](
