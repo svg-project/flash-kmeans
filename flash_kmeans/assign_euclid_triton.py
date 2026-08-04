@@ -833,8 +833,12 @@ def _euclid_assign_kernel(
     maintains the running minimum distance as well as the corresponding index
     for every point in the tile.
     """
-    pid_n = tl.program_id(0)          # tile index along N dimension
-    pid_b = tl.program_id(1)          # batch index
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    # grid.x limit is 2^31-1, handles both big-B and big-N cases.
+    flat_id = tl.program_id(0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b = (flat_id // n_tiles)
+    pid_n = (flat_id % n_tiles)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -956,8 +960,14 @@ def _euclid_assign_kernel_split_d(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    # grid.x limit is 2^31-1, handles both big-B and big-N cases. The
+    # block->(b, tile) linearization matches the old 2D grid (b*n_tiles + tile),
+    # since CUDA enumerates grid.x fastest, so per-program work is unchanged.
+    flat_id = tl.program_id(0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b = (flat_id // n_tiles)
+    pid_n = (flat_id % n_tiles)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -1062,8 +1072,12 @@ def _cosine_assign_kernel(
     maintains the running minimum distance as well as the corresponding index
     for every point in the tile.
     """
-    pid_n = tl.program_id(0)          # tile index along N dimension
-    pid_b = tl.program_id(1)          # batch index
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    # grid.x limit is 2^31-1, handles both big-B and big-N cases.
+    flat_id = tl.program_id(0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b = (flat_id // n_tiles)
+    pid_n = (flat_id % n_tiles)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -1161,8 +1175,14 @@ def _cosine_assign_kernel_split_d(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    # grid.x limit is 2^31-1, handles both big-B and big-N cases. The
+    # block->(b, tile) linearization matches the old 2D grid (b*n_tiles + tile),
+    # since CUDA enumerates grid.x fastest, so per-program work is unchanged.
+    flat_id = tl.program_id(0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b = (flat_id // n_tiles)
+    pid_n = (flat_id % n_tiles)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -1289,7 +1309,10 @@ def euclid_assign_triton(
     stride_csq_b, stride_csq_k = c_sq.stride()
     stride_out_b, stride_out_n = out.stride()
 
-    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    grid = lambda META: (B * triton.cdiv(N, META["BLOCK_N"]),)
+    # split-D kernels now decode the same 1D flattened grid (B * n_tiles,) and
+    # recover (b, tile) from program_id(0), so they also launch for B > 65535.
+    grid_split_d = grid
 
     use_split_d = _need_split_d(D, x.dtype, x.device)
 
@@ -1328,7 +1351,7 @@ def euclid_assign_triton(
 
     if use_split_d:
         if selected_config is None:
-            _euclid_assign_kernel_split_d_autotuned[grid](
+            _euclid_assign_kernel_split_d_autotuned[grid_split_d](
                 x, centroids, x_sq, c_sq, out,
                 B, N, K, D,
                 stride_x_b, stride_x_n, stride_x_d,
@@ -1338,7 +1361,7 @@ def euclid_assign_triton(
                 stride_out_b, stride_out_n,
             )
         else:
-            _euclid_assign_kernel_split_d[grid](
+            _euclid_assign_kernel_split_d[grid_split_d](
                 x, centroids, x_sq, c_sq, out,
                 B, N, K, D,
                 stride_x_b, stride_x_n, stride_x_d,
@@ -1443,10 +1466,12 @@ def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Te
     stride_c_b, stride_c_k, stride_c_d = centroids.stride()
     stride_out_b, stride_out_n = out.stride()
 
-    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    grid = lambda META: (B * triton.cdiv(N, META["BLOCK_N"]),)
+    # split-D kernel decodes the same 1D flattened grid (see euclid path).
+    grid_split_d = grid
 
     if _need_split_d(D, x.dtype, x.device):
-        _cosine_assign_kernel_split_d_autotuned[grid](
+        _cosine_assign_kernel_split_d_autotuned[grid_split_d](
             x,
             centroids,
             out,

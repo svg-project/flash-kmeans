@@ -258,12 +258,14 @@ def _centroid_update_chunk_kernel(
     next-power-of-two padding waste (the inner loop iterates over the real D and
     masks only the final partial tile).
     """
-    # program indices – 2-D launch grid: (chunk_id, batch_id)
-    pid_chunk = tl.program_id(axis=0)
-    pid_b     = tl.program_id(axis=1)
+    # FIX: 1D flattened grid — no 65535 limit on either B or N.
+    flat_id = tl.program_id(axis=0)
+    n_tiles = tl.cdiv(N, BLOCK_N)
+    pid_b     = flat_id // n_tiles
+    pid_chunk = flat_id % n_tiles
 
     b = pid_b.to(tl.int64)
-    chunk_start = (pid_chunk * BLOCK_N).to(tl.int64)  # position of the first token handled by this program
+    chunk_start = (pid_chunk * BLOCK_N).to(tl.int64)
 
     # Nothing to do – out of range
     if chunk_start >= N:
@@ -338,7 +340,7 @@ def triton_centroid_update_sorted_cosine(x_norm: torch.Tensor, cluster_ids: torc
     centroid_sums = torch.zeros((B, K, D), device=x_norm.device, dtype=torch.float32)
     centroid_cnts = torch.zeros((B, K),    device=x_norm.device, dtype=torch.int32)
 
-    grid = (triton.cdiv(N, BLOCK_N), B)
+    grid = (B * triton.cdiv(N, BLOCK_N),)
     _centroid_update_chunk_kernel[grid](
         x_norm,
         sorted_idx_int,
@@ -409,7 +411,7 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
     else:
         assert centroid_cnts.shape == (B, K)
 
-    grid = (triton.cdiv(N, BLOCK_N), B)
+    grid = (B * triton.cdiv(N, BLOCK_N),)
     _centroid_update_chunk_kernel[grid](
         x,                       # original features
         sorted_idx_int,          # gather indices
