@@ -69,7 +69,10 @@ def run_case(tag, B, N, K, D):
 
 def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}\n")
-    ok = all(run_case(tag, **shape) for tag, shape in CASES)
+    # List (not generator) so all() can't short-circuit: every case must run
+    # even after a failure, so `main` demonstrates both D regimes failing.
+    results = [run_case(tag, **shape) for tag, shape in CASES]
+    ok = all(results)
     print(f"=> {'ALL LAUNCHED (grid fix works)' if ok else 'LAUNCH FAILED (expected on main)'}")
 
 
