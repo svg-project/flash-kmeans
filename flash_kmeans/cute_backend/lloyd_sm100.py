@@ -68,6 +68,9 @@ class KMeansAssignSm100:
         self.n_blocks = (ncls + TILE_N - 1) // TILE_N
         self.fuse_sums = fuse_sums
         self.topj = topj  # 1: argmin; 4: sorted top-4 candidates (repair)
+        self.num_sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
         assert topj in (1, 4)
         if topj != 1:
             assert not fuse_sums, "top-4 variant is for the repair path only"
@@ -121,7 +124,7 @@ class KMeansAssignSm100:
         # persistent grid: 2 CTAs per SM, grid-stride over (m_tile, l) tiles
         # (shapes are compile-time static here, so plain Python arithmetic)
         num_tiles = ((mX.shape[0] + TILE_M - 1) // TILE_M) * mX.shape[2]
-        n_persistent = cutlass.utils.HardwareInfo(0).get_device_multiprocessor_count() * 2
+        n_persistent = self.num_sms * 2
         grid = (min(num_tiles, n_persistent), 1, 1)
         self.kernel(
             tiled_mma,
@@ -723,9 +726,7 @@ def _compile_on_device(device):
     """Compile with the tensors' own device as current: the kernels bake
     device facts at trace time (persistent-grid SM count), so the bake must
     match the launch target and the `num_sms` in the cache key.
-    (sm100's HardwareInfo(0) additionally reads physical GPU 0 — pre-existing
-    kernel semantics; homogeneous single-model nodes are unaffected either
-    way.) Restores the previous current device on exit."""
+    Restores the previous current device on exit."""
     prev = torch.cuda.current_device()
     changed = (device is not None and getattr(device, "index", None) is not None
                and device.index != prev)
