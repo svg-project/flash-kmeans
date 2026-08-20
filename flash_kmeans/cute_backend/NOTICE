@@ -1,0 +1,8 @@
+CuTe backend attribution
+========================
+
+The CuTe k-means kernels were developed in DongyunZou/flash-kmeans-cute by
+Dongyun Zou and Ligeng Zhu, then adapted to the flash-kmeans backend API.
+
+cache_utils.py contains code adapted from Dao-AILab/flash-attention's CuTe JIT
+cache. That code is distributed under the adjacent BSD 3-Clause LICENSE.
