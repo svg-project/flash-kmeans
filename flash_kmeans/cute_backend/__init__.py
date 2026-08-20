@@ -12,6 +12,9 @@ import torch
 from .arch import get_lloyd_module
 
 FEATURE_DIM = 128
+MIN_BATCH_SIZE = 1
+MIN_SAMPLES = 2
+MIN_CLUSTERS = 2
 MAX_CLUSTERS = 1024
 
 
@@ -23,6 +26,11 @@ def _validate_inputs(
 ) -> None:
     if x.ndim != 3:
         raise ValueError(f"x must have shape (B, N, D), got {tuple(x.shape)}")
+    if x.shape[0] < MIN_BATCH_SIZE:
+        raise ValueError(
+            f"The CuTe backend requires at least {MIN_BATCH_SIZE} batch, "
+            f"got B={x.shape[0]}."
+        )
     if not x.is_cuda:
         raise ValueError("The CuTe backend requires x to be a CUDA tensor.")
     if x.dtype != torch.bfloat16:
@@ -33,10 +41,15 @@ def _validate_inputs(
         raise ValueError(
             f"The CuTe backend requires D={FEATURE_DIM}, got D={x.shape[-1]}."
         )
-    if not 1 <= int(n_clusters) <= MAX_CLUSTERS:
+    if x.shape[1] < MIN_SAMPLES:
+        raise ValueError(
+            f"The CuTe backend requires at least {MIN_SAMPLES} samples, "
+            f"got N={x.shape[1]}."
+        )
+    if not MIN_CLUSTERS <= int(n_clusters) <= MAX_CLUSTERS:
         raise ValueError(
             f"The CuTe backend supports at most {MAX_CLUSTERS} clusters "
-            f"(and at least 1), got {n_clusters}."
+            f"(and at least {MIN_CLUSTERS}), got {n_clusters}."
         )
     if max_iters < 1:
         raise ValueError(f"max_iters must be at least 1, got {max_iters}.")

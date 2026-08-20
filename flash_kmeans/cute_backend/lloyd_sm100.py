@@ -669,7 +669,7 @@ class FinalizeUpdateSm100:
         zero_after: Int32,
         stream: cuda.CUstream,
     ):
-        grid = (self.ncls, mHist.shape[1], 1)
+        grid = (self.ncls * mHist.shape[1], 1, 1)
         self.kernel(mSums, mHist, mCent, mCsq, zero_after).launch(
             grid=grid, block=[self.d, 1, 1], stream=stream
         )
@@ -684,7 +684,9 @@ class FinalizeUpdateSm100:
         zero_after: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        c, l, _ = cute.arch.block_idx()
+        flat, _, _ = cute.arch.block_idx()
+        c = flat % self.ncls
+        l = flat // self.ncls
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(_FinalizeSharedStorage)

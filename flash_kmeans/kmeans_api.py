@@ -54,8 +54,8 @@ def batch_kmeans_Euclid(
     """Run batched Euclidean k-means with the selected backend.
 
     ``backend="triton"`` is the default and preserves the existing behavior.
-    The optional CuTe backend currently supports CUDA bf16 inputs with D=128
-    and at most 1024 clusters on SM90, SM100, and SM120 GPUs.
+    The optional CuTe backend currently supports CUDA bf16 inputs with B>=1,
+    D=128, N>=2, and 2 to 1024 clusters on SM90, SM100, and SM120 GPUs.
     """
     backend = _validate_backend(backend)
     common = dict(

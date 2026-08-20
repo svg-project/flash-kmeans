@@ -146,11 +146,41 @@ def test_cute_tolerance_return_matches_triton_contract():
     torch.testing.assert_close(cute_centroids, triton_centroids)
 
 
+def test_cute_supports_batch_larger_than_cuda_grid_y_limit():
+    batch = 65536
+    x = torch.randn(batch, 2, 128, device="cuda", dtype=torch.bfloat16)
+    initial = x.clone()
+
+    ids, centroids, n_iters = batch_kmeans_Euclid(
+        x, 2, max_iters=1, tol=0.0, init_centroids=initial, backend="cute"
+    )
+
+    assert ids.shape == (batch, 2)
+    assert centroids.shape == (batch, 2, 128)
+    assert n_iters == 1
+
+
+def test_cute_rejects_single_sample_train_and_predict():
+    x = torch.randn(1, 1, 128, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="at least 2 samples"):
+        batch_kmeans_Euclid(x, 2, max_iters=1, backend="cute")
+
+    model = FlashKMeans(
+        d=128, k=2, niter=1, dtype=torch.bfloat16, backend="cute"
+    )
+    model.fit(torch.randn(2, 128, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="at least 2 samples"):
+        model.predict(x.squeeze(0))
+
+
 @pytest.mark.parametrize(
     ("shape", "dtype", "clusters", "message"),
     [
+        ((0, 2, 128), torch.bfloat16, 2, "at least 1 batch"),
         ((1, 32, 64), torch.bfloat16, 4, "requires D=128"),
         ((1, 32, 128), torch.float16, 4, "requires x.dtype=torch.bfloat16"),
+        ((1, 32, 128), torch.bfloat16, 1, "at least 2"),
         ((1, 32, 128), torch.bfloat16, 1025, "at most 1024 clusters"),
     ],
 )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import sys
 from typing import Optional, Union
 
 import torch
@@ -13,6 +14,8 @@ SUPPORTED_ARCHS = ("sm90", "sm100", "sm120")
 
 @functools.lru_cache(maxsize=1)
 def _check_dependencies() -> None:
+    if sys.version_info < (3, 10):
+        raise RuntimeError("The CuTe backend requires Python 3.10 or newer.")
     try:
         import cutlass
     except ImportError as exc:

@@ -28,8 +28,8 @@ dependencies = [
 
 [project.optional-dependencies]
 cute = [
-  "nvidia-cutlass-dsl[cu13]>=4.6.0,<4.8",
-  "quack-kernels>=0.6.1,<0.7",
+  "nvidia-cutlass-dsl[cu13]>=4.6.0,<4.8; python_version >= '3.10'",
+  "quack-kernels>=0.6.1,<0.7; python_version >= '3.10'",
 ]
 
 [project.urls]

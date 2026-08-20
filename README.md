@@ -65,8 +65,8 @@ labels = model.fit_predict(x)
 ```
 
 The CuTe backend requires Python 3.10+ and a CUDA 13-compatible environment.
-It currently supports CUDA bf16 inputs with `D=128`, `K<=1024`, and SM90,
-SM100, or SM120 GPUs. It supports the existing `tol`,
+It currently supports CUDA bf16 inputs with `B>=1`, `N>=2`, `D=128`,
+`2<=K<=1024`, and SM90, SM100, or SM120 GPUs. It supports the existing `tol`,
 `verbose`, `init_centroids`, `fit`, and `predict` interfaces. Large CPU-resident
 datasets, cosine k-means, and dot-product k-means remain on the existing Triton
 paths. The legacy `FlashKMeans(use_triton=...)` option remains supported; the
