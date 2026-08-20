@@ -43,4 +43,4 @@ packages = ["flash_kmeans", "flash_kmeans.cute_backend"]
 [tool.setuptools.package-data]
 # Include any Triton kernels or additional runtime data if needed
 flash_kmeans = ["kernels/*"]
-"flash_kmeans.cute_backend" = ["LICENSE", "NOTICE"]
+"flash_kmeans.cute_backend" = ["LICENSE-BSD-3-Clause", "NOTICE"]
