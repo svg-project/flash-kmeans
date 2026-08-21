@@ -4,9 +4,8 @@ atomic_add_fp32x4 is the vectorized red.global.add.v4.f32 from FA4
 (flash_attn/cute/copy_utils.py); atomic_add_i32/fp32 follow the
 nvvm.atomicrmw pattern used by quack/FA4.
 """
-import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm, vector
 
@@ -14,6 +13,50 @@ from cutlass._mlir.dialects import llvm, nvvm, vector
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    """``elem_pointer`` with the linear index evaluated in 64 bits.
+
+    ``cute.crd2idx`` sums ``coord[i] * stride[i]`` in int32, which wraps as
+    soon as a tensor holds 2**31 or more elements -- for the (N, D, L) view of
+    x that is just 4 GiB of bf16. The wrapped, negative offset is then sign
+    extended into the GEP and the access lands about 4 GiB below the base,
+    i.e. an illegal address rather than a wrong answer. Use this for the
+    SIMT gmem walks over x; the TMA paths carry a 64-bit tensormap and are
+    unaffected. The strides are compile-time constants, so this costs one
+    hoisted 64-bit multiply-add per tile, not per element.
+    """
+    idx = Int64(0)
+    for c, s in zip(coord, x.stride):
+        idx = idx + Int64(c) * Int64(s)
+    return x.iterator + idx
+
+
+def _max_linear_index(x: cute.Tensor):
+    """Largest index ``crd2idx`` can produce for ``x``, or None if not static."""
+    try:
+        return 1 + sum(
+            (int(s) - 1) * int(st) for s, st in zip(x.shape, x.stride)
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+@dsl_user_op
+def elem_pointer_auto(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    """``elem_pointer``, promoted to 64-bit indexing only when it can overflow.
+
+    Shapes and strides are compile-time constants here, so the choice is made
+    at trace time: tensors that cannot reach 2**31 elements keep the cheaper
+    int32 arithmetic (and byte-identical codegen), and only the large ones pay
+    for 64-bit address math. Falls back to 64-bit if the extents are dynamic.
+    """
+    limit = _max_linear_index(x)
+    if limit is not None and limit < 2**31:
+        return elem_pointer(x, coord, loc=loc, ip=ip)
+    return elem_pointer_i64(x, coord, loc=loc, ip=ip)
 
 
 @dsl_user_op

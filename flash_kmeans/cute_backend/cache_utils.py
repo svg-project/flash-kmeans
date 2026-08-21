@@ -27,6 +27,9 @@ staged and atomically renamed so readers never observe a partial object file.
 If apache-tvm-ffi is unavailable or an export/load fails, the cache degrades
 to in-memory (per-process) behavior rather than failing the caller.
 """
+from __future__ import annotations
+
+import errno
 import fcntl
 import hashlib
 import os
@@ -37,20 +40,12 @@ import time
 from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
-from typing import Hashable, TypeAlias
+from typing import Hashable
 
 import ctypes
 
 import cutlass
 import cutlass.cute as cute
-
-# Pre-load cute DSL runtime libraries with RTLD_GLOBAL so their symbols
-# (e.g. _cudaLibraryLoadData) are visible to .o modules later loaded via
-# dlopen (mirrors FA4; upstream cute.runtime.load_module loads them without
-# RTLD_GLOBAL, which breaks loading cached kernels from disk in some setups).
-for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
-    if Path(_lib_path).exists():
-        ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
 
 try:
     import tvm_ffi
@@ -59,9 +54,9 @@ except ImportError:
     tvm_ffi = None
     _TVM_FFI_AVAILABLE = False
 
-CompileKeyType: TypeAlias = tuple[Hashable, ...]
+CompileKeyType = tuple[Hashable, ...]
 # TVMFFIJitCompiledFunction (fresh compile) or tvm_ffi.Function (disk load)
-CompiledFnType: TypeAlias = object
+CompiledFnType = object
 
 _ENABLED = os.getenv("FLASH_KMEANS_CUTE_DSL_CACHE_ENABLED", "1") == "1"
 _CACHE_DIR = os.getenv("FLASH_KMEANS_CUTE_DSL_CACHE_DIR", None)
@@ -77,6 +72,28 @@ def _parse_verbose(value: str) -> int:
 _VERBOSE = _parse_verbose(os.getenv("FLASH_KMEANS_CUTE_DSL_CACHE_VERBOSE", "0"))
 
 EXPORT_FUNCTION_PREFIX = "func"
+
+
+@lru_cache(maxsize=1)
+def _preload_runtime_libraries() -> None:
+    """Map the cute DSL runtime libraries with RTLD_GLOBAL.
+
+    Their symbols (e.g. ``_cudaLibraryLoadData``) have to be visible to the
+    ``.o`` modules dlopen'd from the disk cache; upstream
+    ``cute.runtime.load_module`` loads them RTLD_LOCAL, which breaks loading
+    cached kernels in some setups (mirrors FlashAttention-4).
+
+    Called lazily from the disk-load path rather than at import, so that
+    disabling the cache really disables it, and failures only cost the disk
+    cache instead of taking the whole backend down with an ImportError.
+    """
+    for lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
+        try:
+            if Path(lib_path).exists():
+                ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            fk_log(1, f"Could not preload {lib_path} ({exc!r}); "
+                      "loading kernels from disk may fail")
 
 
 def tvm_ffi_available() -> bool:
@@ -122,6 +139,14 @@ def _compute_source_fingerprint() -> str:
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"tvm_ffi={tvm_ffi.__version__ if tvm_ffi else 'none'}".encode())
+    # CUTE_DSL_* reconfigure the DSL compiler itself -- CUTE_DSL_ARCH overrides
+    # the compile target outright, CUTE_DSL_LINEINFO and CUTE_DSL_COMPILER_OPT
+    # change the emitted code (an instrumented build is ~3.5x the size of the
+    # default one). Without them here two differently-configured runs share a
+    # cache path and the second silently loads the first one's kernel.
+    h.update(repr(sorted(
+        (k, v) for k, v in os.environ.items() if k.startswith("CUTE_DSL_")
+    )).encode())
 
     import torch
     h.update(f"torch={torch.__version__}".encode())
@@ -187,7 +212,18 @@ class FileLock:
             try:
                 fcntl.flock(self._fd, lock_type | fcntl.LOCK_NB)
                 return self
-            except OSError:
+            except OSError as exc:
+                # Only EWOULDBLOCK/EAGAIN mean "someone else holds it". On a
+                # filesystem without working locks (NFS with no lockd, some
+                # FUSE mounts) flock fails with e.g. ENOLCK on every attempt,
+                # and retrying just burns the full timeout on every key of
+                # every run while never managing to cache anything.
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    os.close(self._fd)
+                    self._fd = -1
+                    raise RuntimeError(
+                        f"flock is not available on {self.lock_path}: {exc!r}"
+                    ) from exc
                 if time.monotonic() >= deadline:
                     os.close(self._fd)
                     self._fd = -1
@@ -198,7 +234,7 @@ class FileLock:
                 time.sleep(0.1)
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._fd is not None:
+        if self._fd >= 0:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
             os.close(self._fd)
             self._fd = -1
@@ -264,6 +300,7 @@ class JITPersistentCache(JITCache):
                     fk_log(1, f"Disk cache miss: {sha256_hex}")
                     return False
                 try:
+                    _preload_runtime_libraries()
                     m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
                     fn = getattr(m, EXPORT_FUNCTION_PREFIX)
                     fk_log(1, f"Loaded compiled kernel from disk: {obj_path}")

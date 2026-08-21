@@ -37,12 +37,12 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass import Boolean, Float32, Int32
+from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
 from .cute_utils import (atomic_add_fp32x4, atomic_add_i32, elem_pointer,
-                         f32_bits, i32_as_f32)
+                         elem_pointer_auto, f32_bits, i32_as_f32)
 
 TILE_M = 128
 TILE_N = 128
@@ -63,17 +63,20 @@ class _AssignSharedStorage:
 
 
 class KMeansAssignSm100:
-    def __init__(self, ncls: int, fuse_sums: bool = True, topj: int = 1):
+    def __init__(self, ncls: int, fuse_sums: bool = True,
+                 write_best: bool = True):
         self.ncls = ncls
         self.n_blocks = (ncls + TILE_N - 1) // TILE_N
         self.fuse_sums = fuse_sums
-        self.topj = topj  # 1: argmin; 4: sorted top-4 candidates (repair)
+        # mBest (the packed score of the winning centroid) is write-only:
+        # nothing in the kernel reads it back. A caller that does not consume
+        # it -- dist^2 = mBest + mXsq -- passes write_best=False, which drops
+        # the store at trace time and lets it hand in a placeholder instead of
+        # a full (M, L) buffer. The flag is part of the compile cache key.
+        self.write_best = write_best
         self.num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        assert topj in (1, 4)
-        if topj != 1:
-            assert not fuse_sums, "top-4 variant is for the repair path only"
 
     @cute.jit
     def __call__(
@@ -180,8 +183,11 @@ class KMeansAssignSm100:
         # accumulator subtiles), 8-15 sums-scatter consumers (decoupled via a
         # 2-slot sIdx ring so tile t's scatter overlaps tile t+1's argmin),
         # 16 MMA, 17 TMA.
-        # fuse_sums (Lloyd): 8 argmin warps + 8 scatter warps;
-        # topj repair variant: no scatter role, so all 16 warps do argmin
+        # fuse_sums (Lloyd): 8 argmin warps + 8 scatter warps -> 2 groups;
+        # assign-only: no scatter role, so all 16 warps do argmin -> 4 groups.
+        # Each group owns n_sub/n_epi_groups accumulator subtiles, so ALL
+        # n_epi_groups partial argmins have to be merged below -- see the
+        # merge step, which reduces over n_epi_groups - 1 peers.
         n_epi_groups = 2 if self.fuse_sums else 4
         argmin_end = 4 * n_epi_groups
         epilogue_warp_ids = tuple(range(argmin_end))
@@ -213,15 +219,11 @@ class KMeansAssignSm100:
             layout=cute.make_layout(N_BLOCKS * TILE_N),
             byte_alignment=16,
         )
-        n_peers = 1 if self.fuse_sums else 3
+        # one slot per row per non-merging group; group 0 reduces over them
+        n_peers = n_epi_groups - 1
         sValB = smem.allocate_tensor(
             element_type=cutlass.Float32,
-            layout=cute.make_layout(TILE_M * self.topj * n_peers),
-            byte_alignment=16,
-        )
-        sIdxB = smem.allocate_tensor(
-            element_type=cutlass.Int32,
-            layout=cute.make_layout(TILE_M * self.topj * n_peers),
+            layout=cute.make_layout(TILE_M * n_peers),
             byte_alignment=16,
         )
 
@@ -443,12 +445,6 @@ class KMeansAssignSm100:
 
                 best = Float32(3.0e38)
                 best_idx = Int32(0)
-                b1v = Float32(3.0e38)
-                b2v = Float32(3.0e38)
-                b3v = Float32(3.0e38)
-                b1i = Int32(0)
-                b2i = Int32(0)
-                b3i = Int32(0)
 
                 for n_blk in cutlass.range_constexpr(N_BLOCKS):
                     cute.experimental.iket.range_push("acc_wait")
@@ -466,25 +462,12 @@ class KMeansAssignSm100:
                         for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                             col = n_blk * TILE_N + tTR_cC[(None, None, None, 0, s)][i][1]
                             score = sCsq[col] - 2.0 * tTR_rAcc[i]
-                            if cutlass.const_expr(self.topj == 1):
-                                # packed argmin: col id lives in the low 10
-                                # mantissa bits (score coarsened by ~2^-13
-                                # relative) — one fmin carries value + index
-                                packed = i32_as_f32(
-                                    (f32_bits(score) & Int32(-1024)) | Int32(col))
-                                best = cute.arch.fmin(packed, best)
-                            else:
-                                coli = Int32(col)
-                                if score < b3v:
-                                    # insertion into the sorted 4 (best==b0)
-                                    b3i = b2i if score < b2v else coli
-                                    b3v = b2v if score < b2v else score
-                                    b2i = b1i if score < b1v else (coli if score < b2v else b2i)
-                                    b2v = b1v if score < b1v else (score if score < b2v else b2v)
-                                    b1i = best_idx if score < best else (coli if score < b1v else b1i)
-                                    b1v = best if score < best else (score if score < b1v else b1v)
-                                    best_idx = coli if score < best else best_idx
-                                    best = score if score < best else best
+                            # packed argmin: col id lives in the low 10
+                            # mantissa bits (score coarsened by ~2^-13
+                            # relative) — one fmin carries value + index
+                            packed = i32_as_f32(
+                                (f32_bits(score) & Int32(-1024)) | Int32(col))
+                            best = cute.arch.fmin(packed, best)
                     cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         acc_full.release()
@@ -495,56 +478,39 @@ class KMeansAssignSm100:
                 if cutlass.const_expr(self.fuse_sums):
                     # reserve the ring slot before group 0 writes it
                     ring.producer_acquire(ring_pstate)
-                if cutlass.const_expr(self.topj == 1):
-                    if group == 1:
-                        sValB[row_in_tile] = best
-                    epilogue_sync_barrier.arrive_and_wait()
-                    if group == 0:
-                        # packed values merge with fmin (index rides in the
-                        # low bits; ties resolve deterministically)
-                        best = cute.arch.fmin(sValB[row_in_tile], best)
-                        best_idx = f32_bits(best) & Int32(1023)
-                        if row_valid:
-                            mIdx[row_g, l] = best_idx
+                # Every group holds the argmin over its OWN subtiles, i.e. its
+                # own slice of the 128 centroid columns, so group 0 must
+                # reduce over all n_peers = n_epi_groups - 1 of the others.
+                # Merging only group 1 silently drops columns 64..127 whenever
+                # n_epi_groups == 4 (the assign-only path), which is correct
+                # only while K <= 64 leaves those columns as padding.
+                if group > 0:
+                    sValB[(group - 1) * TILE_M + row_in_tile] = best
+                epilogue_sync_barrier.arrive_and_wait()
+                if group == 0:
+                    # packed values merge with fmin (index rides in the
+                    # low bits; ties resolve deterministically)
+                    for p in cutlass.range_constexpr(n_peers):
+                        best = cute.arch.fmin(sValB[p * TILE_M + row_in_tile], best)
+                    best_idx = f32_bits(best) & Int32(1023)
+                    # The accumulator seed and the padded-column sentinel are
+                    # both a plain 3.0e38, NOT a packed value, so they decode
+                    # to a bogus id: bits(3.0e38) & 1023 == 486, or the pad
+                    # column index. A row reaches that state whenever no real
+                    # column produced a finite score -- one NaN/Inf anywhere
+                    # in the row (fmin drops NaNs, and packing an inf yields
+                    # a NaN), or a c_sq that overflows fp32. Unclamped, the id
+                    # feeds the mHist atomic and the mSums scatter below and
+                    # writes past the end of both buffers.
+                    best_idx = best_idx if best_idx < NCLS else Int32(NCLS - 1)
+                    if row_valid:
+                        mIdx[row_g, l] = best_idx
+                        if cutlass.const_expr(self.write_best):
                             mBest[row_g, l] = best
-                            atomic_add_i32(1, elem_pointer(mHist, (best_idx, l)))
-                        if cutlass.const_expr(self.fuse_sums):
-                            sIdxR[ring_pstate.index * TILE_M + row_in_tile] = (
-                                best_idx if row_valid else Int32(-1))
-                else:
-                    if group > 0:
-                        base_s = (row_in_tile * 3 + (group - 1)) * 4
-                        sValB[base_s + 0] = best
-                        sIdxB[base_s + 0] = best_idx
-                        sValB[base_s + 1] = b1v
-                        sIdxB[base_s + 1] = b1i
-                        sValB[base_s + 2] = b2v
-                        sIdxB[base_s + 2] = b2i
-                        sValB[base_s + 3] = b3v
-                        sIdxB[base_s + 3] = b3i
-                    epilogue_sync_barrier.arrive_and_wait()
-                    if group == 0:
-                        for j in cutlass.range_constexpr(12):
-                            vb = sValB[row_in_tile * 12 + j]
-                            ib = sIdxB[row_in_tile * 12 + j]
-                            if vb < b3v:
-                                b3i = b2i if vb < b2v else ib
-                                b3v = b2v if vb < b2v else vb
-                                b2i = b1i if vb < b1v else (ib if vb < b2v else b2i)
-                                b2v = b1v if vb < b1v else (vb if vb < b2v else b2v)
-                                b1i = best_idx if vb < best else (ib if vb < b1v else b1i)
-                                b1v = best if vb < best else (vb if vb < b1v else b1v)
-                                best_idx = ib if vb < best else best_idx
-                                best = vb if vb < best else best
-                        if row_valid:
-                            mIdx[row_g, 0, l] = best_idx
-                            mBest[row_g, 0, l] = best
-                            mIdx[row_g, 1, l] = b1i
-                            mBest[row_g, 1, l] = b1v
-                            mIdx[row_g, 2, l] = b2i
-                            mBest[row_g, 2, l] = b2v
-                            mIdx[row_g, 3, l] = b3i
-                            mBest[row_g, 3, l] = b3v
+                        atomic_add_i32(1, elem_pointer(mHist, (best_idx, l)))
+                    if cutlass.const_expr(self.fuse_sums):
+                        sIdxR[ring_pstate.index * TILE_M + row_in_tile] = (
+                            best_idx if row_valid else Int32(-1))
                 cute.experimental.iket.range_pop()  # merge
                 if cutlass.const_expr(self.fuse_sums):
                     # hand the slot to the scatter warps
@@ -591,10 +557,10 @@ class KMeansAssignSm100:
                             rg_s = rg if rg < M_total else M_total - 1
                             if cutlass.const_expr(len(mX_plain.shape) == 4):
                                 Hp = mX_plain.shape[2]
-                                xptr = elem_pointer(
+                                xptr = elem_pointer_auto(
                                     mX_plain, (rg_s, d0, l % Hp, l // Hp))
                             else:
-                                xptr = elem_pointer(mX_plain, (rg_s, d0, l))
+                                xptr = elem_pointer_auto(mX_plain, (rg_s, d0, l))
                             ptr8 = cute.make_ptr(
                                 cutlass.BFloat16,
                                 xptr.toint(),
@@ -609,6 +575,13 @@ class KMeansAssignSm100:
                             r = swid * rows_per_warp + b * BATCH + j
                             c_r = sIdxR[sbase + r]
                             rx = rxs[j]
+                            # Do NOT make this block conditional at compile
+                            # time to save the mXsq buffer: rx[] loses its
+                            # second consumer, the compiler sinks the batched
+                            # 8-row prefetch above into the atomic branch, and
+                            # this kernel gets 2.7x slower (16.1 -> 43.9 ms at
+                            # B=80 N=75600 K=591 on B200). Measured, not
+                            # theoretical.
                             if write_xsq != 0:
                                 q = (Float32(rx[0]) * Float32(rx[0])
                                      + Float32(rx[1]) * Float32(rx[1])
@@ -770,21 +743,30 @@ def _compile_args(device, tensors):
     return cute_tensors, stream, {}
 
 
-def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, topj=1, rank4=False):
+def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, rank4=False,
+                  write_best=True):
     # The kernel specializes on the STATIC layout of the example tensors, so
     # BOTH shape and strides of the (permuted) x view go into the key:
     # rank-4 views with the same shape but different layouts (NHD-permuted vs
     # HND-contiguous, or different B/H splits at equal BH) are distinct
     # specializations. The other views are fresh contiguous allocations whose
-    # layouts are fully determined by geom+K+topj (see call sites).
+    # layouts are fully determined by geom+K (see call sites).
     xshape = tuple(tensors[0].shape)  # (N, D, BH) or (N, D, H, B)
     xstrides = tuple(tensors[0].stride())
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    akey = ("sm100", xshape, xstrides, K, fuse_sums, topj, num_sms, "assign")
+    # The DSL compiles for the launching device's exact target, so the key
+    # must carry the real capability, not the kernel family: sm_100 (B200)
+    # and sm_103 (B300/GB300) both select this module and both report 148
+    # SMs, so neither the family string nor num_sms separates them.
+    cap = torch.cuda.get_device_capability(device)
+    # write_best changes both the emitted store and the layout of the mBest
+    # example tensor, so it must be part of the key.
+    akey = ("sm100", cap, xshape, xstrides, K, fuse_sums, num_sms,
+            write_best, "assign")
     # FinalizeUpdateSm100 specializes only on K and the (K,D,BH)/(K,BH)
     # contiguous views — key it on exactly that so new token counts N reuse
     # it (it has no device dependence either: grid=(K, BH), block=(D)).
-    fkey = ("sm100", "finalize", K, xshape[1], BH)
+    fkey = ("sm100", cap, "finalize", K, xshape[1], BH)
     need_a = akey not in _compile_cache
     need_f = fuse_sums and fkey not in _compile_cache
     if need_a or need_f:
@@ -793,7 +775,8 @@ def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, topj=1, rank4=False
                 _compile_args(device, tensors)
             if need_a:
                 _compile_cache[akey] = cute.compile(
-                    KMeansAssignSm100(K, fuse_sums=fuse_sums, topj=topj),
+                    KMeansAssignSm100(K, fuse_sums=fuse_sums,
+                                      write_best=write_best),
                     xv, cv, csqv, iv, bv, hv, sv, qv, Int32(1), stream,
                     **ckwargs,
                 )
@@ -803,65 +786,3 @@ def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, topj=1, rank4=False
                     **ckwargs,
                 )
     return _compile_cache[akey], (_compile_cache[fkey] if fuse_sums else None)
-
-
-@torch.no_grad()
-def lloyd_cute(x: torch.Tensor, n_clusters: int, max_iters: int,
-               init_centroids: torch.Tensor | None = None):
-    """x: [BH, N, D=128] bf16 contiguous CUDA. Returns
-    (ids i32 [BH,N], scores f32 [BH,N], counts i32 [BH,K], centroids bf16
-    [BH,K,D], x_sq f32 [BH,N]). scores = c_sq - 2 x.c of the assigned cluster
-    (dist^2 = scores + x_sq; x_sq is computed for free in the fused scatter)."""
-    assert x.dtype == torch.bfloat16
-    if x.dim() == 4:
-        # [B, H, N, D] view with D innermost-contiguous (e.g. a permuted NHD
-        # tensor) — consumed zero-copy via a 4D TMA descriptor
-        Bx, Hx, N, D = x.shape
-        BH = Bx * Hx
-        assert x.stride(-1) == 1
-        xv_t = x.permute(2, 3, 1, 0)               # (N, D, H, B)
-    else:
-        assert x.is_contiguous()
-        BH, N, D = x.shape
-        xv_t = x.permute(1, 2, 0)                  # (N, D, BH)
-    assert D == TILE_K, f"D={D} unsupported (expected {TILE_K})"
-    K = n_clusters
-    device = x.device
-
-    if init_centroids is None:
-        idx = torch.randint(0, N, (BH, K), device=device)
-        if x.dim() == 4:
-            cents = torch.gather(
-                x, 2, idx.view(Bx, Hx, K, 1).expand(-1, -1, -1, D)
-            ).reshape(BH, K, D).contiguous()
-        else:
-            cents = torch.gather(x, 1, idx[..., None].expand(-1, -1, D)).contiguous()
-    else:
-        cents = init_centroids.to(torch.bfloat16).contiguous().clone()
-
-    csq = (cents.float() ** 2).sum(-1).contiguous()
-    ids = torch.empty(BH, N, dtype=torch.int32, device=device)
-    best = torch.empty(BH, N, dtype=torch.float32, device=device)
-    hist = torch.zeros(BH, K, dtype=torch.int32, device=device)
-    sums = torch.zeros(BH, K, D, dtype=torch.float32, device=device)
-    xsq = torch.empty(BH, N, dtype=torch.float32, device=device)
-
-    views = (
-        xv_t,
-        cents.permute(1, 2, 0),
-        csq.permute(1, 0),
-        ids.permute(1, 0),
-        best.permute(1, 0),
-        hist.permute(1, 0),
-        sums.permute(1, 2, 0),
-        xsq.permute(1, 0),
-    )
-    assign, finalize = _get_compiled(N, K, BH, device, views, rank4=(x.dim() == 4))
-    xv, cv, csqv, iv, bv, hv, sv, qv = views
-
-    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    for it in range(max_iters):
-        assign(xv, cv, csqv, iv, bv, hv, sv, qv,
-               Int32(1 if it == max_iters - 1 else 0), stream)
-        finalize(sv, hv, cv, csqv, Int32(1 if it < max_iters - 1 else 0), stream)
-    return ids, best, hist, cents, xsq

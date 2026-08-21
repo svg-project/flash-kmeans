@@ -66,11 +66,36 @@ labels = model.fit_predict(x)
 
 The CuTe backend requires Python 3.10+ and a CUDA 13-compatible environment.
 It currently supports CUDA bf16 inputs with `B>=1`, `N>=2`, `D=128`,
-`2<=K<=1024`, and SM90, SM100, or SM120 GPUs. It supports the existing `tol`,
+`2<=K<=1024`, and Blackwell GPUs only: `sm_10x` (B200, B300, GB300) and
+`sm_12x` (RTX PRO 6000 series). Any other device is rejected with an explicit
+error rather than falling back silently. It supports the existing `tol`,
 `verbose`, `init_centroids`, `fit`, and `predict` interfaces. Large CPU-resident
 datasets, cosine k-means, and dot-product k-means remain on the existing Triton
 paths. The legacy `FlashKMeans(use_triton=...)` option remains supported; the
 new `backend` argument takes precedence when supplied.
+
+#### Centre your data
+
+The CuTe kernels hide the cluster id in the low 10 mantissa bits of the score
+`‖c‖² − 2·x·c`, so the score is quantised to a *relative* `2⁻¹³`. A non-zero
+mean inflates `|score|` without inflating the gaps between competing centroids,
+which costs accuracy that the Triton backend does not lose. With a few
+channels offset by 64 (the shape of a massive activation / attention sink), a
+10-iteration run gives about 9% higher inertia than Triton and starts
+collapsing clusters.
+
+k-means is translation invariant, so centring is exact and fully restores
+precision:
+
+```python
+mu = x.mean(dim=1, keepdim=True)
+ids, centers, _ = batch_kmeans_Euclid(x - mu, k, backend="cute")
+centers = centers + mu
+```
+
+Data that is already roughly zero-mean (`‖mean‖² ≲ 10·` the per-cluster
+spread) needs nothing. This is not done inside the backend because it costs a
+full extra copy of `x`.
 
 CuTe kernels are compiled on first use. When `apache-tvm-ffi` is available,
 compiled objects are cached across processes under

@@ -1,15 +1,15 @@
 """SM120 (RTX PRO 6000 Blackwell) fused Lloyd iteration in CuTe DSL.
 
-Same two-kernel structure and host contract as lloyd_sm100/lloyd_sm90, with
-the architecture-specific core swapped:
+Same two-kernel structure and host contract as lloyd_sm100, with the
+architecture-specific core swapped:
 
 - warp-level mma.sync m16n8k16 (MmaF16BF16Op) with explicit ldmatrix
   SMEM->RMEM copies (sm120 has no wgmma / tcgen05). atom_layout (8,1,1):
   all 8 math warps tile the M dimension, so each row's score fragment is
-  owned by a single warp and the packed argmin finishes with the same two
-  butterfly shuffles across the owning 4-lane quad as on sm90.
-- TMA G2S loads (supported on sm120) with the same X (1 stage) and
-  C (C_STAGES ring) PipelineTmaAsync pipelines as sm90.
+  owned by a single warp and the packed argmin finishes with two butterfly
+  shuffles across the owning 4-lane quad.
+- TMA G2S loads (supported on sm120) with X (1 stage) and C (C_STAGES ring)
+  PipelineTmaAsync pipelines.
 - X fragments (A operand) are loaded once per tile and reused across all
   centroid blocks; B fragments are ldmatrix'd per stage, software-pipelined
   against the mma.sync stream (quack gemm_sm120 pattern).
@@ -36,7 +36,7 @@ from quack import layout_utils
 from cutlass.utils import LayoutEnum
 
 from .cute_utils import (atomic_add_fp32x4, atomic_add_i32, elem_pointer,
-                         f32_bits, i32_as_f32)
+                         elem_pointer_auto, f32_bits, i32_as_f32)
 
 TILE_M = 128          # rows per X slot; a CTA processes X_PAIR slots
 TILE_N = 32
@@ -53,17 +53,20 @@ class _AssignSharedStorageSm120:
 
 
 class KMeansAssignSm120:
-    def __init__(self, ncls: int, fuse_sums: bool = True, topj: int = 1):
+    def __init__(self, ncls: int, fuse_sums: bool = True,
+                 write_best: bool = True):
         self.ncls = ncls
         self.n_blocks = (ncls + TILE_N - 1) // TILE_N
         self.fuse_sums = fuse_sums
-        self.topj = topj
-        assert topj in (1, 4, 8)
-        if topj != 1:
-            assert not fuse_sums
-        # dual X slots only for the main (topj=1) kernel; the top-4 repair
-        # kernel runs on small excess sets and needs sTopV smem instead
-        self.x_pair = 2 if topj == 1 else 1
+        # mBest (the packed score of the winning centroid) is write-only:
+        # nothing in the kernel reads it back. A caller that does not consume
+        # it -- dist^2 = mBest + mXsq -- passes write_best=False, which drops
+        # the store at trace time and lets it hand in a placeholder instead of
+        # a full (M, L) buffer. The flag is part of the compile cache key.
+        self.write_best = write_best
+        # dual X slots: two 128-row X tiles share one centroid ring, which
+        # halves centroid TMA traffic and gives natural mma/scan overlap
+        self.x_pair = 2
         import torch as _torch
         self.num_sms = _torch.cuda.get_device_properties(
             _torch.cuda.current_device()).multi_processor_count
@@ -169,12 +172,6 @@ class KMeansAssignSm120:
         sCsq = smem.allocate_tensor(
             element_type=cutlass.Float32,
             layout=cute.make_layout(N_BLOCKS * TILE_N),
-            byte_alignment=16,
-        )
-        sTopV = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=cute.make_layout(
-                TILE_M * 4 * self.topj if self.topj > 1 else 4),
             byte_alignment=16,
         )
 
@@ -292,11 +289,11 @@ class KMeansAssignSm120:
                                         rg_s = rg if rg < M_total else M_total - 1
                                         if cutlass.const_expr(len(mX_plain.shape) == 4):
                                             Hp = mX_plain.shape[2]
-                                            xptr = elem_pointer(
+                                            xptr = elem_pointer_auto(
                                                 mX_plain,
                                                 (rg_s, d0s, prev_l % Hp, prev_l // Hp))
                                         else:
-                                            xptr = elem_pointer(
+                                            xptr = elem_pointer_auto(
                                                 mX_plain, (rg_s, d0s, prev_l))
                                         ptr8 = cute.make_ptr(
                                             cutlass.BFloat16, xptr.toint(),
@@ -349,11 +346,11 @@ class KMeansAssignSm120:
                                     rg_s = rg if rg < M_total else M_total - 1
                                     if cutlass.const_expr(len(mX_plain.shape) == 4):
                                         Hp = mX_plain.shape[2]
-                                        xptr = elem_pointer(
+                                        xptr = elem_pointer_auto(
                                             mX_plain,
                                             (rg_s, d0s, prev_l % Hp, prev_l // Hp))
                                     else:
-                                        xptr = elem_pointer(
+                                        xptr = elem_pointer_auto(
                                             mX_plain, (rg_s, d0s, prev_l))
                                     ptr8 = cute.make_ptr(
                                         cutlass.BFloat16, xptr.toint(),
@@ -466,15 +463,10 @@ class KMeansAssignSm120:
                         x_pipe.consumer_release(xc_rel)
                     xc_rel.advance()
 
-                best0 = Float32(3.0e38)
-                best1 = Float32(3.0e38)
                 bests0 = [[Float32(3.0e38) for _ in range(4)]
                           for _ in range(self.x_pair)]
                 bests1 = [[Float32(3.0e38) for _ in range(4)]
                           for _ in range(self.x_pair)]
-                # sorted-J lists (ascending) for the top-J path, one per row
-                bq0 = [Float32(3.0e38) for _ in range(self.topj)]
-                bq1 = [Float32(3.0e38) for _ in range(self.topj)]
 
                 for n_blk in cutlass.range_constexpr(N_BLOCKS):
                     c_pipe.consumer_wait(cc_state)
@@ -503,89 +495,54 @@ class KMeansAssignSm120:
                             for cix in cutlass.range_constexpr(cols_per_thr):
                                 col = n_blk * TILE_N + tScS_mn[r, cix][1]
                                 score = sCsq[col] - 2.0 * acc_mn[r, cix]
-                                if cutlass.const_expr(self.topj == 1):
-                                    packed = i32_as_f32(
-                                        (f32_bits(score) & Int32(-1024)) | Int32(col))
-                                    if r == 0:
-                                        bests0[sl][cix % 4] = cute.arch.fmin(
-                                            packed, bests0[sl][cix % 4])
-                                    else:
-                                        bests1[sl][cix % 4] = cute.arch.fmin(
-                                            packed, bests1[sl][cix % 4])
+                                packed = i32_as_f32(
+                                    (f32_bits(score) & Int32(-1024)) | Int32(col))
+                                if r == 0:
+                                    bests0[sl][cix % 4] = cute.arch.fmin(
+                                        packed, bests0[sl][cix % 4])
                                 else:
-                                    packed = i32_as_f32(
-                                        (f32_bits(score) & Int32(-1024)) | Int32(col))
-                                    # branchless sorted-J insert: 2J-op fmin/fmax
-                                    # bubble network (the divergent if-chain
-                                    # version cost ~3x on this scan)
-                                    bq = bq0 if r == 0 else bq1
-                                    tt = packed
-                                    for jq in cutlass.range_constexpr(self.topj):
-                                        lo = cute.arch.fmin(tt, bq[jq])
-                                        tt = cute.arch.fmax(tt, bq[jq])
-                                        bq[jq] = lo
+                                    bests1[sl][cix % 4] = cute.arch.fmin(
+                                        packed, bests1[sl][cix % 4])
 
                 xr0 = tScS_mn[0, 0][0]
                 xr1 = tScS_mn[1, 0][0] if cutlass.const_expr(rows_per_thr > 1) else xr0
 
-                if cutlass.const_expr(self.topj == 1):
-                    for sl in cutlass.range_constexpr(self.x_pair):
-                        b0 = cute.arch.fmin(
-                            cute.arch.fmin(bests0[sl][0], bests0[sl][1]),
-                            cute.arch.fmin(bests0[sl][2], bests0[sl][3]))
-                        b1 = cute.arch.fmin(
-                            cute.arch.fmin(bests1[sl][0], bests1[sl][1]),
-                            cute.arch.fmin(bests1[sl][2], bests1[sl][3]))
-                        # quad reduce (packed): 2 butterfly rounds
-                        for off in cutlass.range_constexpr(2):
-                            o = 2 >> off
-                            p0 = cute.arch.shuffle_sync_bfly(b0, offset=o, mask_and_clamp=31)
-                            b0 = cute.arch.fmin(p0, b0)
-                            p1 = cute.arch.shuffle_sync_bfly(b1, offset=o, mask_and_clamp=31)
-                            b1 = cute.arch.fmin(p1, b1)
-                        # column-0 lane of each quad writes its two rows
-                        if tScS_mn[0, 0][1] == 0:
-                            for r in cutlass.range_constexpr(2):
-                                row_g = (mp * self.x_pair + sl) * TILE_M \
-                                    + (xr0 if r == 0 else xr1)
-                                bv = b0 if r == 0 else b1
-                                bi = f32_bits(bv) & Int32(1023)
-                                if row_g < M_total:
-                                    mIdx[row_g, l] = bi
-                                    mBest[row_g, l] = bv
-                                    atomic_add_i32(1, elem_pointer(mHist, (bi, l)))
-                                if cutlass.const_expr(self.fuse_sums):
-                                    rloc = sl * TILE_M + (xr0 if r == 0 else xr1)
-                                    sIdx[sidx_off + rloc] = \
-                                        bi if row_g < M_total else Int32(-1)
-                else:
-                    # top-4: publish each quad lane's sorted-4 (packed) to smem;
-                    # the col-0 lane merges 16 -> 4 and writes
-                    lane_q = tidx_m % 4
-                    for r in cutlass.range_constexpr(2):
-                        rloc = xr0 if r == 0 else xr1
-                        base_s = (rloc * 4 + lane_q) * self.topj
-                        bq = bq0 if r == 0 else bq1
-                        for jq in cutlass.range_constexpr(self.topj):
-                            sTopV[base_s + jq] = bq[jq]
-                    math_barrier.arrive_and_wait()
+                for sl in cutlass.range_constexpr(self.x_pair):
+                    b0 = cute.arch.fmin(
+                        cute.arch.fmin(bests0[sl][0], bests0[sl][1]),
+                        cute.arch.fmin(bests0[sl][2], bests0[sl][3]))
+                    b1 = cute.arch.fmin(
+                        cute.arch.fmin(bests1[sl][0], bests1[sl][1]),
+                        cute.arch.fmin(bests1[sl][2], bests1[sl][3]))
+                    # quad reduce (packed): 2 butterfly rounds
+                    for off in cutlass.range_constexpr(2):
+                        o = 2 >> off
+                        p0 = cute.arch.shuffle_sync_bfly(b0, offset=o, mask_and_clamp=31)
+                        b0 = cute.arch.fmin(p0, b0)
+                        p1 = cute.arch.shuffle_sync_bfly(b1, offset=o, mask_and_clamp=31)
+                        b1 = cute.arch.fmin(p1, b1)
+                    # column-0 lane of each quad writes its two rows
                     if tScS_mn[0, 0][1] == 0:
                         for r in cutlass.range_constexpr(2):
-                            rloc = xr0 if r == 0 else xr1
-                            row_g = mp * TILE_M + rloc
-                            mq = [Float32(3.0e38) for _ in range(self.topj)]
-                            for j in cutlass.range_constexpr(4 * self.topj):
-                                vv = sTopV[rloc * 4 * self.topj + j]
-                                tt = vv
-                                for jq in cutlass.range_constexpr(self.topj):
-                                    lo = cute.arch.fmin(tt, mq[jq])
-                                    tt = cute.arch.fmax(tt, mq[jq])
-                                    mq[jq] = lo
+                            row_g = (mp * self.x_pair + sl) * TILE_M \
+                                + (xr0 if r == 0 else xr1)
+                            bv = b0 if r == 0 else b1
+                            bi = f32_bits(bv) & Int32(1023)
+                            # See lloyd_sm100: the seed / pad sentinel 3.0e38
+                            # is not a packed value and decodes to 486 (or the
+                            # pad column index) when no real column produced a
+                            # finite score. Unclamped it walks off the end of
+                            # mHist and mSums.
+                            bi = bi if bi < NCLS else Int32(NCLS - 1)
                             if row_g < M_total:
-                                for jq in cutlass.range_constexpr(self.topj):
-                                    mIdx[row_g, jq, l] = f32_bits(mq[jq]) & Int32(1023)
-                                    mBest[row_g, jq, l] = mq[jq]
-
+                                mIdx[row_g, l] = bi
+                                if cutlass.const_expr(self.write_best):
+                                    mBest[row_g, l] = bv
+                                atomic_add_i32(1, elem_pointer(mHist, (bi, l)))
+                            if cutlass.const_expr(self.fuse_sums):
+                                rloc = sl * TILE_M + (xr0 if r == 0 else xr1)
+                                sIdx[sidx_off + rloc] = \
+                                    bi if row_g < M_total else Int32(-1)
                 if cutlass.const_expr(self.fuse_sums):
                     # publish sIdx(t) to the scatter warps (producer warps
                     # 1..3 scatter tile t while the math warps run tile t+1)
@@ -600,8 +557,12 @@ class KMeansAssignSm120:
                 t = t + grid_x
 
 
-# host wrapper: same contract as lloyd_sm100
-from .lloyd_sm100 import (  # noqa: E402
+# host wrapper: same contract as lloyd_sm100.
+# _views is re-exported, not used here: cute_backend/__init__.py reaches it as
+# `<arch module>._views(...)`. Keep the F401 suppression -- without it a bare
+# `ruff check --fix` deletes the name and the SM120 backend dies at runtime
+# while the lint run reports success.
+from .lloyd_sm100 import (  # noqa: E402, F401
     FinalizeUpdateSm100,
     _compile_args,
     _compile_cache,
@@ -610,15 +571,23 @@ from .lloyd_sm100 import (  # noqa: E402
 )
 
 
-def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, topj=1,
-                  rank4=False):
+def _get_compiled(N, K, BH, device, tensors, fuse_sums=True,
+                  rank4=False, write_best=True):
     # See lloyd_sm100._get_compiled for the cache-key rationale (static
     # shape+stride specialization, slim finalize key, num_sms, disk cache).
     xshape = tuple(tensors[0].shape)  # (N, D, BH) or (N, D, H, B)
     xstrides = tuple(tensors[0].stride())
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    akey = ("sm120", xshape, xstrides, K, fuse_sums, topj, num_sms, "assign")
-    fkey = ("sm120", "finalize", K, xshape[1], BH)
+    # The DSL compiles for the launching device's exact target, so the key
+    # must carry the real capability, not the kernel family: sm_100 (B200)
+    # and sm_103 (B300/GB300) both select this module and both report 148
+    # SMs, so neither the family string nor num_sms separates them.
+    cap = torch.cuda.get_device_capability(device)
+    # write_best changes both the emitted store and the layout of the mBest
+    # example tensor, so it must be part of the key.
+    akey = ("sm120", cap, xshape, xstrides, K, fuse_sums, num_sms,
+            write_best, "assign")
+    fkey = ("sm120", cap, "finalize", K, xshape[1], BH)
     need_a = akey not in _compile_cache
     need_f = fuse_sums and fkey not in _compile_cache
     if need_a or need_f:
@@ -627,7 +596,8 @@ def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, topj=1,
                 _compile_args(device, tensors)
             if need_a:
                 _compile_cache[akey] = cute.compile(
-                    KMeansAssignSm120(K, fuse_sums=fuse_sums, topj=topj),
+                    KMeansAssignSm120(K, fuse_sums=fuse_sums,
+                                      write_best=write_best),
                     xv, cv, csqv, iv, bv, hv, sv, qv, Int32(1), stream,
                     **ckwargs,
                 )
@@ -638,60 +608,3 @@ def _get_compiled(N, K, BH, device, tensors, fuse_sums=True, topj=1,
                     **ckwargs,
                 )
     return _compile_cache[akey], (_compile_cache[fkey] if fuse_sums else None)
-
-
-@torch.no_grad()
-def lloyd_cute(x: torch.Tensor, n_clusters: int, max_iters: int,
-               init_centroids: torch.Tensor | None = None):
-    assert x.dtype == torch.bfloat16
-    if x.dim() == 4:
-        Bx, Hx, N, D = x.shape
-        BH = Bx * Hx
-        assert x.stride(-1) == 1
-        xv_t = x.permute(2, 3, 1, 0)
-    else:
-        assert x.is_contiguous()
-        BH, N, D = x.shape
-        xv_t = x.permute(1, 2, 0)
-    assert D == TILE_K
-    K = n_clusters
-    device = x.device
-
-    if init_centroids is None:
-        idx = torch.randint(0, N, (BH, K), device=device)
-        if x.dim() == 4:
-            cents = torch.gather(
-                x, 2, idx.view(Bx, Hx, K, 1).expand(-1, -1, -1, D)
-            ).reshape(BH, K, D).contiguous()
-        else:
-            cents = torch.gather(x, 1, idx[..., None].expand(-1, -1, D)).contiguous()
-    else:
-        cents = init_centroids.to(torch.bfloat16).contiguous().clone()
-
-    csq = (cents.float() ** 2).sum(-1).contiguous()
-    ids = torch.empty(BH, N, dtype=torch.int32, device=device)
-    best = torch.empty(BH, N, dtype=torch.float32, device=device)
-    hist = torch.zeros(BH, K, dtype=torch.int32, device=device)
-    sums = torch.zeros(BH, K, D, dtype=torch.float32, device=device)
-    xsq = torch.empty(BH, N, dtype=torch.float32, device=device)
-
-    views = (
-        xv_t,
-        cents.permute(1, 2, 0),
-        csq.permute(1, 0),
-        ids.permute(1, 0),
-        best.permute(1, 0),
-        hist.permute(1, 0),
-        sums.permute(1, 2, 0),
-        xsq.permute(1, 0),
-    )
-    assign, finalize = _get_compiled(N, K, BH, device, views,
-                                     rank4=(x.dim() == 4))
-    xv, cv, csqv, iv, bv, hv, sv, qv = views
-
-    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    for it in range(max_iters):
-        assign(xv, cv, csqv, iv, bv, hv, sv, qv,
-               Int32(1 if it == max_iters - 1 else 0), stream)
-        finalize(sv, hv, cv, csqv, Int32(1 if it < max_iters - 1 else 0), stream)
-    return ids, best, hist, cents, xsq

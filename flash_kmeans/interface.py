@@ -58,7 +58,9 @@ class FlashKMeans:
         Currently, only CUDA devices are supported.
     backend : {"triton", "cute", "torch"} | None
         Implementation to use. ``None`` preserves the existing ``use_triton``
-        behavior. The CuTe backend requires CUDA bf16 data with D=128.
+        behavior. The CuTe backend requires CUDA bf16 data with D=128 on an
+        sm_10x (B200, B300, GB300) or sm_12x (RTX PRO 6000 series) GPU; an
+        unsupported ``device`` is rejected at construction time.
     """
 
     def __init__(
@@ -109,8 +111,6 @@ class FlashKMeans:
                 )
                 self.backend = "torch"
                 self.use_triton = False
-        elif self.backend == "cute" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required to run the CuTe-backed k-means implementation.")
 
         # Store raw device for largeN multi-GPU path (None = auto-detect all GPUs)
         self._raw_device = device
@@ -119,6 +119,15 @@ class FlashKMeans:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
+
+        if self.backend == "cute":
+            # Reject an unsupported GPU here rather than at the first fit():
+            # get_arch only needs torch, so this stays cheap and does not pull
+            # in the optional CuTe dependencies.
+            from flash_kmeans.cute_backend.arch import get_arch
+
+            get_arch(self.device)
+
         self.centroids_b = None
         self.cluster_ids_b = None
 

@@ -55,7 +55,11 @@ def batch_kmeans_Euclid(
 
     ``backend="triton"`` is the default and preserves the existing behavior.
     The optional CuTe backend currently supports CUDA bf16 inputs with B>=1,
-    D=128, N>=2, and 2 to 1024 clusters on SM90, SM100, and SM120 GPUs.
+    D=128, N>=2, and 2 to 1024 clusters on sm_10x (B200, B300, GB300) and
+    sm_12x (RTX PRO 6000 series) GPUs. It packs the cluster id into the low
+    mantissa bits of the score, so it wants roughly zero-mean data: subtract
+    ``x.mean(dim=1, keepdim=True)`` first if the input is far from the origin
+    (k-means is translation invariant, so this is exact). See the README.
     """
     backend = _validate_backend(backend)
     common = dict(
