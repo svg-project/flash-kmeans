@@ -4,7 +4,7 @@
 | <a href="https://svg-project.github.io/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2603.09229"><b>Paper</b></a> | <a href="https://x.com/HaochengXiUCB/status/2033693755791052804"><b>Twitter/X</b></a> |
 </p>
 
-IO-aware batched K-Means clustering implemented with Triton GPU kernels and an optional CuTe DSL backend. This repository provides the official K-Means implementation of [Sparse VideoGen2](https://arxiv.org/pdf/2505.18875).
+IO-aware batched K-Means clustering implemented with Triton GPU kernels. This repository provides the official K-Means implementation of [Sparse VideoGen2](https://arxiv.org/pdf/2505.18875).
 
 ![Teasor](assets/FlashAssignAndTime.png)
 
@@ -15,12 +15,6 @@ Install flash-kmeans with `pip`:
 
 ```bash
 pip install flash-kmeans
-```
-
-Install the optional CuTe backend dependencies with:
-
-```bash
-pip install "flash-kmeans[cute]"
 ```
 
 From source:
@@ -42,66 +36,6 @@ cluster_ids, centers, _ = batch_kmeans_Euclid(x, n_clusters=1000, tol=1e-4, verb
 ```
 
 We also provide a API interface similar to `faiss/sklearn`, see [API docs](https://github.com/svg-project/flash-kmeans/blob/main/flash_kmeans/interface.py) for details.
-
-### CuTe backend
-
-The default remains `backend="triton"`. Select the fused CuTe DSL
-implementation explicitly for supported workloads:
-
-```python
-import torch
-from flash_kmeans import FlashKMeans, batch_kmeans_Euclid
-
-x = torch.randn(32, 75600, 128, device="cuda", dtype=torch.bfloat16)
-cluster_ids, centers, _ = batch_kmeans_Euclid(
-    x, n_clusters=591, max_iters=10, tol=0.0, backend="cute"
-)
-
-model = FlashKMeans(
-    d=128, k=591, niter=10, tol=0.0,
-    dtype=torch.bfloat16, backend="cute",
-)
-labels = model.fit_predict(x)
-```
-
-The CuTe backend requires Python 3.10+ and a CUDA 13-compatible environment.
-It currently supports CUDA bf16 inputs with `B>=1`, `N>=2`, `D=128`,
-`2<=K<=1024`, and Blackwell GPUs only: `sm_10x` (B200, B300, GB300) and
-`sm_12x` (RTX PRO 6000 series). Any other device is rejected with an explicit
-error rather than falling back silently. It supports the existing `tol`,
-`verbose`, `init_centroids`, `fit`, and `predict` interfaces. Large CPU-resident
-datasets, cosine k-means, and dot-product k-means remain on the existing Triton
-paths. The legacy `FlashKMeans(use_triton=...)` option remains supported; the
-new `backend` argument takes precedence when supplied.
-
-#### Centre your data
-
-The CuTe kernels hide the cluster id in the low 10 mantissa bits of the score
-`‖c‖² − 2·x·c`, so the score is quantised to a *relative* `2⁻¹³`. A non-zero
-mean inflates `|score|` without inflating the gaps between competing centroids,
-which costs accuracy that the Triton backend does not lose. With a few
-channels offset by 64 (the shape of a massive activation / attention sink), a
-10-iteration run gives about 9% higher inertia than Triton and starts
-collapsing clusters.
-
-k-means is translation invariant, so centring is exact and fully restores
-precision:
-
-```python
-mu = x.mean(dim=1, keepdim=True)
-ids, centers, _ = batch_kmeans_Euclid(x - mu, k, backend="cute")
-centers = centers + mu
-```
-
-Data that is already roughly zero-mean (`‖mean‖² ≲ 10·` the per-cluster
-spread) needs nothing. This is not done inside the backend because it costs a
-full extra copy of `x`.
-
-CuTe kernels are compiled on first use. When `apache-tvm-ffi` is available,
-compiled objects are cached across processes under
-`/tmp/$USER/flash_kmeans_cute_dsl_cache`; set
-`FLASH_KMEANS_CUTE_DSL_CACHE_DIR` to override the location or
-`FLASH_KMEANS_CUTE_DSL_CACHE_ENABLED=0` to disable the persistent cache.
 
 ## Benchmark
 

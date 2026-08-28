@@ -1,30 +1,32 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import Optional
-
+from flash_kmeans.torch_fallback import euclid_assign_torch_native_chunked, batch_kmeans_Euclid_torch_native
 import torch
 
-from flash_kmeans.kmeans_api import (
-    BACKENDS,
-    _require_triton_backend,
-    batch_kmeans_Euclid,
-    euclid_assign,
-)
-from flash_kmeans.kmeans_large import kmeans_largeN, kmeans_largeN_assign
-from flash_kmeans.torch_fallback import batch_kmeans_Euclid_torch_native
+try:
+    from flash_kmeans.kmeans_triton_impl import batch_kmeans_Euclid 
+    from flash_kmeans.assign_euclid_triton import euclid_assign_triton
+    from flash_kmeans.kmeans_large import kmeans_largeN, kmeans_largeN_assign
+    _HAS_TRITON_IMPL = True
+except Exception:
+    _HAS_TRITON_IMPL = False
 
 
 def _require_triton_cuda():
-    _require_triton_backend()
+    if not _HAS_TRITON_IMPL:
+        raise RuntimeError(
+            "flash_kmeans Triton kernels are not available. "
+            "Ensure the package modules are importable."
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run the Triton-backed k-means implementation.")
 
 
 class FlashKMeans:
     """
-    Fast batched K-Means clustering with selectable GPU backends.
+    Fast batched K-Means clustering implemented with Triton GPU kernels.
 
     Parameters
     ----------
@@ -37,7 +39,7 @@ class FlashKMeans:
     tol : float, default=1e-8
         Convergence tolerance on centroid shift.
     use_triton : bool, default=True
-        Backward-compatible backend switch. Ignored when ``backend`` is set.
+        Whether to use triton implementation. If False, falls back to PyTorch implementation.
     seed : int, default=0
         Random seed for centroid initialization.
     chunk_size_data : int, default=32768
@@ -56,11 +58,6 @@ class FlashKMeans:
     device : torch.device | None
         Target device. Defaults to "cuda:0" when available.
         Currently, only CUDA devices are supported.
-    backend : {"triton", "cute", "torch"} | None
-        Implementation to use. ``None`` preserves the existing ``use_triton``
-        behavior. The CuTe backend requires CUDA bf16 data with D=128 on an
-        sm_10x (B200, B300, GB300) or sm_12x (RTX PRO 6000 series) GPU; an
-        unsupported ``device`` is rejected at construction time.
     """
 
     def __init__(
@@ -77,20 +74,12 @@ class FlashKMeans:
         verbose: bool = False,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
-        backend: Optional[str] = None,
     ):
         self.d = int(d)
         self.k = int(k)
         self.niter = int(niter)
         self.tol = float(tol)
-        backend_was_explicit = backend is not None
-        if backend is None:
-            backend = "triton" if use_triton else "torch"
-        elif backend not in BACKENDS:
-            choices = ", ".join(repr(choice) for choice in BACKENDS)
-            raise ValueError(f"backend must be one of {choices}, got {backend!r}.")
-        self.backend = backend
-        self.use_triton = backend == "triton"
+        self.use_triton = bool(use_triton)
         self.seed = int(seed)
         self.chunk_size_data = int(chunk_size_data)
         self.chunk_size_centroids = int(chunk_size_centroids)
@@ -98,18 +87,11 @@ class FlashKMeans:
         self.verbose = bool(verbose)
         self.dtype = dtype
 
-        if self.backend == "triton":
+        if self.use_triton:
             try:
                 _require_triton_cuda()
             except RuntimeError as e:
-                if backend_was_explicit:
-                    raise
-                warnings.warn(
-                    f"Falling back to PyTorch implementation: {e}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self.backend = "torch"
+                Warning(f"Falling back to PyTorch implementation: {e}")
                 self.use_triton = False
 
         # Store raw device for largeN multi-GPU path (None = auto-detect all GPUs)
@@ -119,17 +101,6 @@ class FlashKMeans:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
-
-        if self.backend == "cute":
-            # Reject an unsupported GPU here rather than at the first fit():
-            # get_arch only needs torch, so this stays cheap and does not pull
-            # in the optional CuTe dependencies.
-            from flash_kmeans.cute_backend.arch import get_arch
-
-            get_arch(self.device)
-
-        self.centroids_b = None
-        self.cluster_ids_b = None
 
 
     def train(self, data: torch.Tensor):
@@ -165,10 +136,7 @@ class FlashKMeans:
         if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
             # handle for large N on CPU
             assert B is None, "Batched data with large N on CPU is not supported yet."
-            if self.backend != "triton":
-                raise NotImplementedError(
-                    "Large CPU-resident datasets currently require backend='triton'."
-                )
+            assert self.use_triton, "process large N data requires triton implementation." 
             cluster_ids_b, centroids_b  = kmeans_largeN(
                 x_b[0],
                 self.k,
@@ -186,7 +154,8 @@ class FlashKMeans:
             compute_dtype = self.dtype or x_b.dtype
             x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
 
-            if self.backend != "torch":
+            if self.use_triton:
+                # Run batched Triton KMeans (Euclidean)
                 cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
                     x_b,
                     self.k,
@@ -194,7 +163,6 @@ class FlashKMeans:
                     tol=self.tol,
                     init_centroids=None,
                     verbose=self.verbose,
-                    backend=self.backend,
                 )
             else:
                 # Run batched PyTorch KMeans (Euclidean)
@@ -220,7 +188,7 @@ class FlashKMeans:
 
     def predict(self, data: torch.Tensor) -> torch.LongTensor:
         """
-        Assign each point to the nearest centroid using the selected backend.
+        Assign each point to the nearest centroid using the Triton assign kernel.
 
         Parameters
         ----------
@@ -255,10 +223,7 @@ class FlashKMeans:
         if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
             # handle for large N on CPU
             assert B is None, "Batched data with large N on CPU is not supported yet."
-            if self.backend != "triton":
-                raise NotImplementedError(
-                    "Large CPU-resident datasets currently require backend='triton'."
-                )
+            assert self.use_triton, "process large N data requires triton implementation." 
             labels = kmeans_largeN_assign(
                 x_b[0],
                 self.centroids_b[0],
@@ -272,23 +237,25 @@ class FlashKMeans:
         compute_dtype = self.dtype or x_b.dtype 
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
  
-        x_sq = None
-        if self.backend != "cute":
-            # Chunked to avoid materializing a full (B, N, D) temp.
-            N_ = x_b.shape[1]
-            x_sq = torch.empty(x_b.shape[:-1], device=x_b.device, dtype=x_b.dtype)
-            _CHUNK = 1 << 20
-            for i in range(0, N_, _CHUNK):
-                x_sq[:, i:i + _CHUNK] = (x_b[:, i:i + _CHUNK] ** 2).sum(dim=-1)
+        # Chunked to avoid materializing a full (B, N, D) temp.
+        N_ = x_b.shape[1]
+        x_sq = torch.empty(x_b.shape[:-1], device=x_b.device, dtype=x_b.dtype)
+        _CHUNK = 1 << 20
+        for i in range(0, N_, _CHUNK):
+            x_sq[:, i:i + _CHUNK] = (x_b[:, i:i + _CHUNK] ** 2).sum(dim=-1)
 
-        labels_b = euclid_assign(
-            x_b,
-            self.centroids_b,
-            x_sq,
-            backend=self.backend,
-            chunk_size_data=self.chunk_size_data,
-            chunk_size_centroids=self.chunk_size_centroids,
-        )
+        if self.use_triton:
+            # Call Triton assignment kernel
+            labels_b = euclid_assign_triton(x_b, self.centroids_b, x_sq)
+        else:
+            # Call PyTorch assignment fallback
+            labels_b = euclid_assign_torch_native_chunked(
+                x_b,
+                self.centroids_b,
+                x_sq,
+                chunk_size_N=self.chunk_size_data,
+                chunk_size_K=self.chunk_size_centroids,
+            )
 
         if B is None:
             return labels_b.squeeze(0)  # (N,)
