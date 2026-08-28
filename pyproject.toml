@@ -15,7 +15,7 @@ license = { file = "LICENSE.txt" }
 keywords = ["kmeans", "gpu", "triton", "clustering", "pytorch"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: Apache Software License",
+  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -26,21 +26,14 @@ dependencies = [
   "tqdm"
 ]
 
-[project.optional-dependencies]
-cute = [
-  "nvidia-cutlass-dsl[cu13]>=4.6.0,<4.8; python_version >= '3.10'",
-  "quack-kernels>=0.6.1,<0.7; python_version >= '3.10'",
-]
-
 [project.urls]
 Homepage = "https://github.com/svg-project/flash-kmeans"
 BugTracker = "https://github.com/svg-project/flash-kmeans/issues"
 Source = "https://github.com/svg-project/flash-kmeans"
 
 [tool.setuptools]
-packages = ["flash_kmeans", "flash_kmeans.cute_backend"]
+packages = ["flash_kmeans"]
 
 [tool.setuptools.package-data]
 # Include any Triton kernels or additional runtime data if needed
 flash_kmeans = ["kernels/*"]
-"flash_kmeans.cute_backend" = ["LICENSE-BSD-3-Clause", "NOTICE"]
