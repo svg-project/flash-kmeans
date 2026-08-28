@@ -2,8 +2,15 @@ import torch
 import torch.nn.functional as F
 from torch.cuda import nvtx
 from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton
-from flash_kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid, triton_centroid_update_sorted_cosine
+from flash_kmeans.centroid_update_triton import (
+    triton_centroid_update_cosine,
+    triton_centroid_update_euclid,
+    triton_centroid_update_sorted_euclid,
+    triton_centroid_update_sorted_cosine,
+    triton_centroid_update_sorted_euclid_weighted,
+)
 from tqdm import trange
+from flash_kmeans.torch_fallback import scalable_kmeans_pp, standard_kmeans_pp
 
 # -------------------- Compiled single-iteration kernels --------------------
 
@@ -36,6 +43,13 @@ def _dot_iter(x, centroids):
     shift = (centroids_new - centroids).norm(dim=-1).max()
     return centroids_new, shift, cluster_ids
 
+def _euclid_iter_weighted(x, x_sq, centroids, weights, use_heuristic=True):
+    cluster_ids = euclid_assign_triton(x, centroids, x_sq, use_heuristic=use_heuristic)
+    centroids_new = triton_centroid_update_sorted_euclid_weighted(x, cluster_ids, centroids, weights)
+    shift = (centroids_new - centroids).norm(dim=-1).max()
+    return centroids_new, shift, cluster_ids
+
+
 COMPILE_FLAG = False
 
 try:
@@ -61,6 +75,7 @@ def batch_kmeans_Euclid(
     verbose=False,
     *,
     use_heuristic=True,
+    init="random",
 ):
     """
     Batched KMeans clustering in PyTorch using Euclidean distance.
@@ -76,7 +91,15 @@ def batch_kmeans_Euclid(
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
-    B, N, D = x.shape
+    B, N, D_orig = x.shape
+
+    # Triton tl.dot requires inner dim >= 16; pad with zeros if needed
+    if D_orig < _MIN_TRITON_D:
+        pad = _MIN_TRITON_D - D_orig
+        x = F.pad(x, (0, pad))  # (B, N, D_padded)
+        if init_centroids is not None:
+            init_centroids = F.pad(init_centroids, (0, pad))
+    D = x.shape[-1]
 
     # Pre-compute squared L2 norm of all points (constant during iterations).
     # Done in chunks to avoid materializing a full (B, N, D) `x ** 2` temp,
@@ -87,13 +110,19 @@ def batch_kmeans_Euclid(
         x_sq[:, i:i + XSQ_CHUNK] = (x[:, i:i + XSQ_CHUNK] ** 2).sum(dim=-1)
 
     if init_centroids is None:
-        # Randomly select initial centers from x
-        indices = torch.randint(0, N, (B, n_clusters), device=x.device)
-        centroids = torch.gather(
-            x,
-            dim=1,
-            index=indices[..., None].expand(-1, -1, D)
-        )  # (B, n_clusters, D)
+        if init == "scalable-kmeans++":
+            centroids = scalable_kmeans_pp(x, n_clusters, x_sq)
+        elif init == "standard-kmeans++":
+            centroids = standard_kmeans_pp(x, n_clusters, x_sq)
+        else:
+            # Randomly select initial centers from x (without replacement, matching sklearn)
+            uniform = torch.ones(B, N, device=x.device)
+            indices = torch.multinomial(uniform, n_clusters, replacement=False)
+            centroids = torch.gather(
+                x,
+                dim=1,
+                index=indices[..., None].expand(-1, -1, D)
+            )  # (B, n_clusters, D)
     else:
         centroids = init_centroids
 
@@ -111,6 +140,91 @@ def batch_kmeans_Euclid(
         if center_shift < tol:
             break
         centroids = centroids_new.clone()
+
+    # Strip padding from centroids
+    if D_orig < _MIN_TRITON_D:
+        centroids = centroids[..., :D_orig]
+
+    return cluster_ids, centroids, it + 1
+
+
+_MIN_TRITON_D = 16
+
+
+def batch_kmeans_Euclid_weighted(
+    x,
+    n_clusters,
+    weights,
+    max_iters=100,
+    tol=0.0,
+    init_centroids=None,
+    verbose=False,
+    *,
+    use_heuristic=True,
+    init="random",
+):
+    """
+    Batched weighted KMeans clustering using Euclidean distance.
+
+    Args:
+        x: Tensor of shape (B, N, D), batch_size B, N points per batch, D dims.
+        n_clusters: Number of clusters.
+        weights: Tensor of shape (B, N), per-sample weights (positive).
+        max_iters: Max number of iterations.
+        tol: Relative tolerance for center movement.
+        init_centroids: Optional initial centroids (B, n_clusters, D).
+        verbose: Print loss for each iter.
+        use_heuristic: Use heuristic Triton config (skip autotune).
+    Returns:
+        cluster_ids: (B, N) LongTensor, cluster assignment for each point.
+        centroids: (B, n_clusters, D) final cluster centers.
+        n_iters: number of iterations performed.
+    """
+    B, N, D_orig = x.shape
+
+    # Triton tl.dot requires inner dim >= 16; pad with zeros if needed
+    if D_orig < _MIN_TRITON_D:
+        pad = _MIN_TRITON_D - D_orig
+        x = F.pad(x, (0, pad))  # (B, N, D_padded)
+        if init_centroids is not None:
+            init_centroids = F.pad(init_centroids, (0, pad))
+    D = x.shape[-1]
+
+    x_sq = (x ** 2).sum(dim=-1)  # (B, N)
+
+    if init_centroids is None:
+        if init == "scalable-kmeans++":
+            centroids = scalable_kmeans_pp(x, n_clusters, x_sq, weights=weights)
+        elif init == "standard-kmeans++":
+            centroids = standard_kmeans_pp(x, n_clusters, x_sq, weights=weights)
+        else:
+            # Weighted random initialization
+            probs = weights.float() / weights.float().sum(dim=-1, keepdim=True)
+            indices = torch.multinomial(probs, n_clusters, replacement=False)
+            centroids = torch.gather(
+                x,
+                dim=1,
+                index=indices[..., None].expand(-1, -1, D)
+            )
+    else:
+        centroids = init_centroids
+
+    centroids = centroids.view(B, n_clusters, D)
+
+    for it in range(max_iters):
+        centroids_new, center_shift, cluster_ids = _euclid_iter_weighted(
+            x, x_sq, centroids, weights, use_heuristic
+        )
+
+        if verbose:
+            print(f"Iter {it}, center shift: {center_shift.item():.6f}")
+        if center_shift < tol:
+            break
+        centroids = centroids_new.clone()
+
+    # Strip padding from centroids
+    if D_orig < _MIN_TRITON_D:
+        centroids = centroids[..., :D_orig]
 
     return cluster_ids, centroids, it + 1
 
@@ -135,8 +249,9 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
     x_norm = F.normalize(x, p=2, dim=-1)  # (B, N, D)
 
     if init_centroids is None:
-        # Randomly select initial centers from x_norm
-        indices = torch.randint(0, N, (B, n_clusters), device=x.device)
+        # Randomly select initial centers from x_norm (without replacement, matching sklearn)
+        uniform = torch.ones(B, N, device=x.device)
+        indices = torch.multinomial(uniform, n_clusters, replacement=False)
         centroids = torch.gather(
             x_norm,
             dim=1,
@@ -170,8 +285,9 @@ def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None,
     B, N, D = x.shape
 
     if init_centroids is None:
-        # 随机初始化中心
-        indices = torch.randint(0, N, (B, n_clusters), device=x.device)
+        # Randomly select initial centers (without replacement, matching sklearn)
+        uniform = torch.ones(B, N, device=x.device)
+        indices = torch.multinomial(uniform, n_clusters, replacement=False)
         centroids = torch.gather(
             x,
             dim=1,

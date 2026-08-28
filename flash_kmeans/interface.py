@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from typing import Optional
 from flash_kmeans.torch_fallback import euclid_assign_torch_native_chunked, batch_kmeans_Euclid_torch_native
+
+try:
+    from flash_kmeans.kmeans_triton_impl import batch_kmeans_Euclid_weighted as _batch_kmeans_Euclid_weighted
+    _HAS_WEIGHTED = True
+except Exception:
+    _HAS_WEIGHTED = False
 import torch
 
 try:
@@ -53,6 +59,15 @@ class FlashKMeans:
         the chunk size of n_samples when copying data from CPU to GPU in chunks.
     verbose : bool, default=False
         Whether to print per-iteration info.
+    init : str, default="random"
+        Centroid initialization method.
+        - "random": uniform random selection from data points.
+        - "scalable-kmeans++": scalable kmeans++ / K-Means|| (Bahmani et al., 2012), matches cuml.
+        - "standard-kmeans++": standard greedy kmeans++ (Arthur & Vassilvitskii, 2007), matches scikit-learn.
+    n_init : int | str, default="auto"
+        Number of times k-means is run with different initializations. The
+        result with the lowest inertia is kept. "auto" = 10 for random init,
+        1 for kmeans++ (matching sklearn).
     dtype : torch.dtype, optional
         Compute Data type for algorithm.
     device : torch.device | None
@@ -72,6 +87,8 @@ class FlashKMeans:
         chunk_size_centroids: int = 1024,
         chunk_size_data_cpu: int = 1048576,
         verbose: bool = False,
+        init: str = "random",
+        n_init: int | str = "auto",
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
@@ -85,7 +102,13 @@ class FlashKMeans:
         self.chunk_size_centroids = int(chunk_size_centroids)
         self.chunk_size_data_cpu = int(chunk_size_data_cpu)
         self.verbose = bool(verbose)
+        self.init = init
         self.dtype = dtype
+
+        if n_init == "auto":
+            self.n_init = 10 if init == "random" else 1
+        else:
+            self.n_init = int(n_init)
 
         if self.use_triton:
             try:
@@ -103,7 +126,7 @@ class FlashKMeans:
             self.device = device
 
 
-    def train(self, data: torch.Tensor):
+    def train(self, data: torch.Tensor, weights: torch.Tensor = None):
         """
         Fit KMeans on data and store centroids.
 
@@ -117,6 +140,10 @@ class FlashKMeans:
             if data is from GPU, it will process directly on GPU.
             if data is from CPU, it will copy & process data on GPU by chunk_size_data_cpu.
 
+        weights : torch.Tensor, optional
+            Per-sample weights for weighted k-means.
+            Shape: (n_samples,) or (batch_size, n_samples)
+
         """
 
         if data.ndim == 2:
@@ -129,15 +156,79 @@ class FlashKMeans:
         else:
             raise ValueError("data must be of shape (n_samples, n_features) or (batch_size, n_samples, n_features)")
 
-        # Set random seed
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
+        # Normalize weights shape
+        if weights is not None:
+            if weights.ndim == 1:
+                weights_b = weights.unsqueeze(0)
+            else:
+                weights_b = weights
+            weights_b = weights_b.to(device=self.device, dtype=torch.float32, copy=False)
+        else:
+            weights_b = None
 
-        if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
-            # handle for large N on CPU
+        best_inertia = None  # (B_int,) per-batch inertia
+        best_centroids_b = None
+        best_cluster_ids_b = None
+        B_int = x_b.shape[0]
+
+        for run_i in range(self.n_init):
+            torch.manual_seed(self.seed + run_i)
+            torch.cuda.manual_seed_all(self.seed + run_i)
+
+            cluster_ids_b, centroids_b = self._run_kmeans_once(
+                x_b, N, B, data, weights_b,
+            )
+
+            if self.n_init > 1:
+                # Per-batch inertia so we can pick the best run independently
+                # for each batch element, not just the best run overall.
+                D = x_b.shape[-1]
+                x_eval = x_b.to(device=self.device, dtype=centroids_b.dtype, copy=False)
+                assigned = centroids_b.gather(
+                    1, cluster_ids_b.unsqueeze(-1).expand(-1, -1, D)
+                )
+                inertia = ((x_eval - assigned) ** 2).sum(dim=(-1, -2))  # (B_int,)
+
+                if best_inertia is None:
+                    best_inertia = inertia
+                    best_centroids_b = centroids_b
+                    best_cluster_ids_b = cluster_ids_b
+                else:
+                    improved = inertia < best_inertia  # (B_int,)
+                    best_inertia = torch.where(improved, inertia, best_inertia)
+                    # Update centroids and assignments only for improved batches
+                    mask_c = improved[:, None, None].expand_as(centroids_b)
+                    mask_id = improved[:, None].expand_as(cluster_ids_b)
+                    best_centroids_b = torch.where(mask_c, centroids_b, best_centroids_b)
+                    best_cluster_ids_b = torch.where(mask_id, cluster_ids_b, best_cluster_ids_b)
+            else:
+                best_centroids_b = centroids_b
+                best_cluster_ids_b = cluster_ids_b
+
+        self.centroids_b = best_centroids_b
+        self.cluster_ids_b = best_cluster_ids_b
+        self._batch_size = B
+
+    def _run_kmeans_once(self, x_b, N, B, data, weights_b):
+        """Run a single k-means pass and return (cluster_ids_b, centroids_b)."""
+        if weights_b is not None:
+            assert _HAS_WEIGHTED, "Weighted k-means requires Triton implementation"
+            compute_dtype = self.dtype or x_b.dtype
+            x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
+            cluster_ids_b, centroids_b, _ = _batch_kmeans_Euclid_weighted(
+                x_b,
+                self.k,
+                weights_b,
+                max_iters=self.niter,
+                tol=self.tol,
+                init_centroids=None,
+                verbose=self.verbose,
+                init=self.init,
+            )
+        elif data.device.type == "cpu" and N > self.chunk_size_data_cpu:
             assert B is None, "Batched data with large N on CPU is not supported yet."
-            assert self.use_triton, "process large N data requires triton implementation." 
-            cluster_ids_b, centroids_b  = kmeans_largeN(
+            assert self.use_triton, "process large N data requires triton implementation."
+            cluster_ids_b, centroids_b = kmeans_largeN(
                 x_b[0],
                 self.k,
                 max_iters=self.niter,
@@ -150,12 +241,10 @@ class FlashKMeans:
             centroids_b.unsqueeze_(0)
             cluster_ids_b.unsqueeze_(0)
         else:
-            # Ensure CUDA + dtype
             compute_dtype = self.dtype or x_b.dtype
             x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
 
             if self.use_triton:
-                # Run batched Triton KMeans (Euclidean)
                 cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
                     x_b,
                     self.k,
@@ -163,9 +252,9 @@ class FlashKMeans:
                     tol=self.tol,
                     init_centroids=None,
                     verbose=self.verbose,
+                    init=self.init,
                 )
             else:
-                # Run batched PyTorch KMeans (Euclidean)
                 cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid_torch_native(
                     x_b,
                     self.k,
@@ -175,15 +264,13 @@ class FlashKMeans:
                     verbose=self.verbose,
                     chunk_size_N=self.chunk_size_data,
                     chunk_size_K=self.chunk_size_centroids,
+                    init=self.init,
                 )
- 
-        self.centroids_b = centroids_b
-        self.cluster_ids_b = cluster_ids_b
-        self._batch_size = B
+        return cluster_ids_b, centroids_b
 
-    def fit(self, data: torch.Tensor):
+    def fit(self, data: torch.Tensor, weights: torch.Tensor = None):
         """Alias for train; returns self."""
-        self.train(data)
+        self.train(data, weights=weights)
         return self
 
     def predict(self, data: torch.Tensor) -> torch.LongTensor:
