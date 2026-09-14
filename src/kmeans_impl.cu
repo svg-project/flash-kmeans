@@ -14,6 +14,71 @@ namespace fk {
 namespace {
 
 // ---------------------------------------------------------------------------
+// optional per-phase timing (FLASH_KMEANS_PROFILE=1)
+// ---------------------------------------------------------------------------
+
+struct PhaseProfiler {
+  bool on = false;
+  cudaEvent_t e0{};
+  cudaEvent_t e1{};
+  double t_to_f32 = 0;
+  double t_csq = 0;
+  double t_assign = 0;
+  double t_accum = 0;
+  double t_final = 0;
+  double t_sync = 0;
+
+  PhaseProfiler() {
+    const char* env = std::getenv("FLASH_KMEANS_PROFILE");
+    on = env != nullptr && env[0] != '\0' && env[0] != '0';
+    if (on) {
+      FK_CHECK(cudaEventCreate(&e0));
+      FK_CHECK(cudaEventCreate(&e1));
+    }
+  }
+  ~PhaseProfiler() {
+    if (on) {
+      cudaEventDestroy(e0);
+      cudaEventDestroy(e1);
+    }
+  }
+  void start(cudaStream_t st) {
+    if (on) FK_CHECK(cudaEventRecord(e0, st));
+  }
+  double stop(cudaStream_t st) {
+    if (!on) return 0.0;
+    FK_CHECK(cudaEventRecord(e1, st));
+    FK_CHECK(cudaEventSynchronize(e1));
+    float ms = 0.f;
+    FK_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    return (double)ms;
+  }
+  void report(int iters, std::int64_t B, std::int64_t N, std::int64_t D,
+              std::int64_t K, int mode, int dtype) const {
+    if (!on || iters <= 0) return;
+    const double total =
+        t_to_f32 + t_csq + t_assign + t_accum + t_final + t_sync;
+    std::printf(
+        "[flash-kmeans profile] B=%lld N=%lld D=%lld K=%lld mode=%d dtype=%d "
+        "iters=%d\n",
+        (long long)B, (long long)N, (long long)D, (long long)K, mode, dtype,
+        iters);
+    std::printf("  convert : %8.3f ms  (%5.1f%%)\n", t_to_f32 / iters,
+                100.0 * t_to_f32 / total);
+    std::printf("  csq     : %8.3f ms  (%5.1f%%)\n", t_csq / iters,
+                100.0 * t_csq / total);
+    std::printf("  assign  : %8.3f ms  (%5.1f%%)\n", t_assign / iters,
+                100.0 * t_assign / total);
+    std::printf("  accum   : %8.3f ms  (%5.1f%%)\n", t_accum / iters,
+                100.0 * t_accum / total);
+    std::printf("  finalize: %8.3f ms  (%5.1f%%)\n", t_final / iters,
+                100.0 * t_final / total);
+    std::printf("  sync    : %8.3f ms  (%5.1f%%)\n", t_sync / iters,
+                100.0 * t_sync / total);
+  }
+};
+
+// ---------------------------------------------------------------------------
 // typed batched k-means
 // ---------------------------------------------------------------------------
 
@@ -77,27 +142,45 @@ int batch_kmeans_typed(const T* x, const T* init_centroids, int* out_labels,
 
   int it = 0;
   bool converged = false;
+  PhaseProfiler prof;
   for (; it < max_iters; ++it) {
+    prof.start(st);
     launch_to_fp32<T>(cur.as<T>(), cent_f32.as<float>(), rows_c * D, st);
+    prof.t_to_f32 += prof.stop(st);
+
+    prof.start(st);
     if (!maximize) {
       launch_row_sq<float>(cent_f32.as<float>(), csq.as<float>(), rows_c, (int)D,
                            st);
     }
+    prof.t_csq += prof.stop(st);
+
+    prof.start(st);
     launch_assign_dispatch<T>(xsrc, xsq.as<float>(), cent_f32.as<float>(),
                               csq.as<float>(), B, N, D, K, maximize, out_labels,
                               device, st);
+    prof.t_assign += prof.stop(st);
+
+    prof.start(st);
     FK_CHECK(cudaMemsetAsync(sums.as<float>(), 0, rows_c * D * sizeof(float), st));
     FK_CHECK(cudaMemsetAsync(counts.as<int>(), 0, rows_c * sizeof(int), st));
     launch_accumulate<T>(xsrc, out_labels, sums.as<float>(), counts.as<int>(),
                          rows_x, N, D, K, st);
+    prof.t_accum += prof.stop(st);
+
+    prof.start(st);
     FK_CHECK(cudaMemsetAsync(shift.as<float>(), 0, sizeof(float), st));
     launch_finalize<T>(sums.as<float>(), counts.as<int>(), cur.as<T>(),
                        nxt.as<T>(), shift.as<float>(), B, K, D, normalize_centroids, st);
+    prof.t_final += prof.stop(st);
 
     float host_shift_sq = 0.f;
+    prof.start(st);
     FK_CHECK(cudaMemcpyAsync(&host_shift_sq, shift.as<float>(), sizeof(float),
                              cudaMemcpyDeviceToHost, st));
     FK_CHECK(cudaStreamSynchronize(st));
+    prof.t_sync += prof.stop(st);
+
     const float shift_v = sqrtf(host_shift_sq);
     if (verbose) {
       std::printf("Iter %d, center shift: %.6f\n", it, shift_v);
@@ -108,6 +191,9 @@ int batch_kmeans_typed(const T* x, const T* init_centroids, int* out_labels,
     }
     std::swap(cur, nxt);
   }
+
+  const int executed = converged ? (it + 1) : it;
+  prof.report(executed, B, N, D, K, mode, TypeTraits<T>::kCode);
 
   if (max_iters > 0) {
     FK_CHECK(cudaMemcpyAsync(out_centroids, cur.as<T>(), cent_elems * sizeof(T),

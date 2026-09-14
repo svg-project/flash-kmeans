@@ -77,15 +77,40 @@ machine model. On an RTX 5090 with `B=32, N=74256, D=128, K=1000`, fp16, over
 
 | implementation                       | ms / iteration | TFLOP/s |
 |--------------------------------------|---------------:|--------:|
-| this rewrite (C++/CUDA, SIMT fp32)   |            ~49 |    12.4 |
+| this rewrite (C++/CUDA, SIMT fp32)   |           ~20.3 |    30.0 |
 | original Triton (`tl.dot`)           |            7.7 |    79.3  |
 
+Assignment-only throughput by feature dimension (same shapes):
+
+| D   | ms    | TFLOP/s |
+|----:|------:|--------:|
+| 32  |  4.9  |   31.3  |
+| 64  |  7.7  |   39.4  |
+| 128 | 19.4  |   31.4  |
+| 256 | 64.3  |   18.9  |
+| 512 | 187.3 |   13.0  |
+
 For `D ∈ {32, 64, 128, 256, 512}` the assignment uses compile-time-specialised
-kernels that keep the x row in fp32 registers (split across lanes), which is
-the fastest SIMT formulation here; other dimensions fall back to a
-shared-memory tile kernel, then to a global-memory kernel when the tile does
-not fit. Closing the remaining gap to the tensor-core implementation would
-mean adding a WMMA/CUTLASS-based distance tile plus an argmin epilogue.
+kernels that keep the x row in fp32 registers (shared by `SPLIT` lanes per
+point) and stream centroid tiles through padded shared memory, so the K loop
+runs from shared memory with conflict-free bank access.  Other dimensions fall
+back to a shared-memory tile kernel, then to a global-memory kernel when the
+tile does not fit.  Closing the remaining gap to the tensor-core implementation
+would mean adding a WMMA/CUTLASS-based distance tile plus an argmin epilogue.
+
+### Profiling and performance regression tests
+
+```bash
+FLASH_KMEANS_PROFILE=1 pixi run python benchmarks/bench_kmeans.py
+pixi run bench              # timing table for the standard configurations
+pixi run bench-update       # refresh tests/perf_baselines.json for this GPU
+pixi run perf               # regression check against the recorded baseline
+```
+
+`FLASH_KMEANS_PROFILE=1` enables CUDA-event instrumentation inside the C++
+batch loop and prints a per-phase breakdown (`convert`, `csq`, `assign`,
+`accumulate`, `finalize`, `sync`).  On the fp16 `D=128` benchmark the
+assignment kernel accounts for ~92% of the iteration time.
 
 ## Usage
 
@@ -134,6 +159,13 @@ suites:
 * `tests/test_equivalence_torch.py` compares against a pure-PyTorch reference
   and covers dimension edge cases (`D` odd, non-power-of-two, `D > 512`),
   empty clusters, convergence and seeded random initialization.
+* `tests/test_golden.py` replays frozen outputs produced by the upstream
+  Triton implementation (`tests/data/golden_*.pt`, regenerated with
+  `tests/_generate_golden.py`), so equivalence stays covered even without the
+  upstream checkout.
+* `tests/test_perf_regression.py` guards the assignment/iteration timings
+  against the records in `tests/perf_baselines.json` (run with `pixi run perf`,
+  refresh with `pixi run bench-update`).
 
 Point the Triton tests at any upstream checkout:
 

@@ -35,3 +35,8 @@ Source = "https://github.com/svg-project/flash-kmeans"
 cmake.build-type = "Release"
 wheel.packages = ["flash_kmeans"]
 build-dir = "build/{wheel_tag}"
+
+[tool.pytest.ini_options]
+markers = [
+  "perf: performance regression tests (set FLASH_KMEANS_PERF=1 to run)",
+]

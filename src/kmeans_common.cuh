@@ -255,11 +255,10 @@ __global__ void assign_kernel(const T* __restrict__ x,
 }
 
 // Specialised variant for small compile-time feature dimensions: the x row is
-// kept in fp32 registers and shared by SPLIT consecutive lanes of a warp (each
-// lane holds D/SPLIT values), so register pressure stays around 64 registers
-// and occupancy stays high.  The centroid stream (fp32, float4 loads) is the
-// only memory traffic inside the K loop.
-template <typename T, int D_COMPILE, int SPLIT, bool MAXIMIZE>
+// kept in fp32 registers, shared by SPLIT consecutive lanes of a warp, and the
+// centroid rows are streamed through a shared-memory tile so the K loop runs
+// from shared memory instead of L2.
+template <typename T, int D_COMPILE, int SPLIT, int BK, bool MAXIMIZE>
 __global__ void assign_kernel_reg(const T* __restrict__ x,
                                   const float* __restrict__ xsq,
                                   const float* __restrict__ cent,
@@ -268,6 +267,9 @@ __global__ void assign_kernel_reg(const T* __restrict__ x,
   constexpr int D = D_COMPILE;
   constexpr int DSEG = D / SPLIT;
   static_assert(DSEG == 32 || DSEG == 64, "unsupported register tile");
+  static_assert(D % 4 == 0, "float4 loads require D % 4 == 0");
+  extern __shared__ float s_ctile[];
+
   const int seg = threadIdx.x % SPLIT;
   const int points_per_block = blockDim.x / SPLIT;
   const int b = blockIdx.y;
@@ -298,31 +300,61 @@ __global__ void assign_kernel_reg(const T* __restrict__ x,
   }
 
   const float x2 = xsq ? xsq[(std::size_t)b * n + p_safe] : 0.f;
-  const float* cbase = cent + ((std::size_t)b * k) * D + seg * DSEG;
+  const float* cbase = cent + ((std::size_t)b * k) * D;
   float best = MAXIMIZE ? -FLT_MAX : FLT_MAX;
   int best_k = 0;
-  for (int kk = 0; kk < k; ++kk) {
-    const float* crow = cbase + (std::size_t)kk * D;
-    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+
+  // With SPLIT > 1 each segment is padded by four words so that the lanes of
+  // a point read different shared-memory banks (a power-of-two DSEG would
+  // otherwise map every segment onto the same bank).  SPLIT == 1 keeps the
+  // contiguous layout and vectorised copies.
+  constexpr int SEG_STRIDE = (SPLIT == 1) ? DSEG : (DSEG + 4);
+  for (int k0 = 0; k0 < k; k0 += BK) {
+    const int kcount = (k0 + BK <= k) ? BK : (k - k0);
+    if constexpr (SPLIT == 1) {
+      const float4* __restrict__ g4 =
+          reinterpret_cast<const float4*>(cbase + (std::size_t)k0 * D);
+      float4* s4 = reinterpret_cast<float4*>(s_ctile);
+      const int n4 = kcount * (D / 4);
+      for (int i = threadIdx.x; i < n4; i += blockDim.x) s4[i] = g4[i];
+    } else {
+      const float* __restrict__ gbase = cbase + (std::size_t)k0 * D;
+      const int n = kcount * D;
+      for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int kk = i / D;
+        const int d = i - kk * D;
+        const int sg = d / DSEG;
+        s_ctile[(kk * SPLIT + sg) * SEG_STRIDE + (d - sg * DSEG)] = gbase[i];
+      }
+    }
+    __syncthreads();
+
+    for (int kk = 0; kk < kcount; ++kk) {
+      const float* crow = s_ctile + (kk * SPLIT + seg) * SEG_STRIDE;
+      float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 #pragma unroll
-    for (int i = 0; i < DSEG; i += 4) {
-      const float4 c4 = *reinterpret_cast<const float4*>(crow + i);
-      d0 = fmaf(xr[i], c4.x, d0);
-      d1 = fmaf(xr[i + 1], c4.y, d1);
-      d2 = fmaf(xr[i + 2], c4.z, d2);
-      d3 = fmaf(xr[i + 3], c4.w, d3);
+      for (int i = 0; i < DSEG; i += 4) {
+        const float4 c4 = *reinterpret_cast<const float4*>(crow + i);
+        d0 = fmaf(xr[i], c4.x, d0);
+        d1 = fmaf(xr[i + 1], c4.y, d1);
+        d2 = fmaf(xr[i + 2], c4.z, d2);
+        d3 = fmaf(xr[i + 3], c4.w, d3);
+      }
+      float dot = (d0 + d1) + (d2 + d3);
+      if (SPLIT >= 2) dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+      if (SPLIT >= 4) dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+      if (SPLIT >= 8) dot += __shfl_xor_sync(0xffffffffu, dot, 4);
+      const float score = MAXIMIZE
+                              ? dot
+                              : (x2 + csq[(std::size_t)b * k + k0 + kk] -
+                                 2.f * dot);
+      const bool better = MAXIMIZE ? (score > best) : (score < best);
+      if (better) {
+        best = score;
+        best_k = k0 + kk;
+      }
     }
-    float dot = (d0 + d1) + (d2 + d3);
-    if (SPLIT >= 2) dot += __shfl_xor_sync(0xffffffffu, dot, 1);
-    if (SPLIT >= 4) dot += __shfl_xor_sync(0xffffffffu, dot, 2);
-    if (SPLIT >= 8) dot += __shfl_xor_sync(0xffffffffu, dot, 4);
-    const float score =
-        MAXIMIZE ? dot : (x2 + csq[(std::size_t)b * k + kk] - 2.f * dot);
-    const bool better = MAXIMIZE ? (score > best) : (score < best);
-    if (better) {
-      best = score;
-      best_k = kk;
-    }
+    __syncthreads();
   }
   if (seg == 0 && p < n) labels[(std::size_t)b * n + p] = best_k;
 }

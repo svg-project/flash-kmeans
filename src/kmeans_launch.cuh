@@ -74,8 +74,9 @@ inline void launch_assign(const T* x, const float* xsq, const float* cent,
 }
 
 // Compile-time D specialisations that keep the x row in fp32 registers
-// (shared by SPLIT lanes per point).
-template <typename T, int Dc, int Split, bool Max>
+// (shared by SPLIT lanes per point) and stream centroid tiles through shared
+// memory.
+template <typename T, int Dc, int Split, int Bk, bool Max>
 inline void launch_reg_case(const T* x, const float* xsq, const float* cent,
                             const float* csq, std::int64_t B, std::int64_t N,
                             std::int64_t K, int* labels, cudaStream_t st) {
@@ -83,8 +84,10 @@ inline void launch_reg_case(const T* x, const float* xsq, const float* cent,
   const int points_per_block = bn / Split;
   const dim3 grid((unsigned)((N + points_per_block - 1) / points_per_block),
                   (unsigned)B);
-  assign_kernel_reg<T, Dc, Split, Max>
-      <<<grid, bn, 0, st>>>(x, xsq, cent, csq, (int)N, (int)K, labels);
+  constexpr int kSegStride = (Split == 1) ? (Dc / Split) : ((Dc / Split) + 4);
+  const std::size_t smem = (std::size_t)Bk * Split * kSegStride * sizeof(float);
+  assign_kernel_reg<T, Dc, Split, Bk, Max>
+      <<<grid, bn, smem, st>>>(x, xsq, cent, csq, (int)N, (int)K, labels);
 }
 
 template <typename T>
@@ -94,22 +97,22 @@ inline bool launch_assign_reg(const T* x, const float* xsq, const float* cent,
                               int* labels, cudaStream_t st) {
   constexpr std::int64_t kIntMax = 2147483647;
   if (N > kIntMax || K > kIntMax) return false;
-#define FK_REG_CASE(Dc, Split)                                                \
+#define FK_REG_CASE(Dc, Split, Bk)                                            \
   do {                                                                        \
     if (maximize)                                                             \
-      launch_reg_case<T, Dc, Split, true>(x, xsq, cent, csq, B, N, K, labels, \
-                                          st);                                \
+      launch_reg_case<T, Dc, Split, Bk, true>(x, xsq, cent, csq, B, N, K,     \
+                                              labels, st);                    \
     else                                                                      \
-      launch_reg_case<T, Dc, Split, false>(x, xsq, cent, csq, B, N, K,        \
-                                           labels, st);                       \
+      launch_reg_case<T, Dc, Split, Bk, false>(x, xsq, cent, csq, B, N, K,    \
+                                               labels, st);                   \
     return true;                                                              \
   } while (0)
   switch (D) {
-    case 32: FK_REG_CASE(32, 1);
-    case 64: FK_REG_CASE(64, 1);
-    case 128: FK_REG_CASE(128, 2);
-    case 256: FK_REG_CASE(256, 4);
-    case 512: FK_REG_CASE(512, 8);
+    case 32: FK_REG_CASE(32, 1, 32);
+    case 64: FK_REG_CASE(64, 1, 32);
+    case 128: FK_REG_CASE(128, 2, 32);
+    case 256: FK_REG_CASE(256, 4, 16);
+    case 512: FK_REG_CASE(512, 8, 8);
     default: return false;
   }
 #undef FK_REG_CASE
