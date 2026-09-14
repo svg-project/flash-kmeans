@@ -1,29 +1,29 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "flash-kmeans"
-version = "0.3.1"
-description = "Fast batched K-Means clustering with Triton GPU kernels"
+version = "0.4.0"
+description = "Fast batched K-Means clustering with C++/CUDA kernels (nanobind)"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [
   { name = "Shuo Yang", email = "andy_yang@berkeley.edu" }
 ]
 license = { file = "LICENSE.txt" }
-keywords = ["kmeans", "gpu", "triton", "clustering", "pytorch"]
+keywords = ["kmeans", "gpu", "cuda", "cpp", "clustering", "pytorch"]
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "Programming Language :: CUDA",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
   "torch>=2.0",
-  "triton>=2.0",
   "numpy",
-  "tqdm"
 ]
 
 [project.urls]
@@ -31,9 +31,7 @@ Homepage = "https://github.com/svg-project/flash-kmeans"
 BugTracker = "https://github.com/svg-project/flash-kmeans/issues"
 Source = "https://github.com/svg-project/flash-kmeans"
 
-[tool.setuptools]
-packages = ["flash_kmeans"]
-
-[tool.setuptools.package-data]
-# Include any Triton kernels or additional runtime data if needed
-flash_kmeans = ["kernels/*"]
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["flash_kmeans"]
+build-dir = "build/{wheel_tag}"

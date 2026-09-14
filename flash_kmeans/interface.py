@@ -1,32 +1,22 @@
+"""Drop-in ``FlashKMeans`` estimator backed by the C++/CUDA core.
+
+The constructor, attributes and method semantics match the original
+Triton-based implementation; the compute itself lives in
+``flash_kmeans::batch_kmeans`` / ``flash_kmeans::kmeans_large_n`` (C++/CUDA).
+"""
 
 from __future__ import annotations
 
 from typing import Optional
-from flash_kmeans.torch_fallback import euclid_assign_torch_native_chunked, batch_kmeans_Euclid_torch_native
+
 import torch
 
-try:
-    from flash_kmeans.kmeans_triton_impl import batch_kmeans_Euclid 
-    from flash_kmeans.assign_euclid_triton import euclid_assign_triton
-    from flash_kmeans.kmeans_large import kmeans_largeN, kmeans_largeN_assign
-    _HAS_TRITON_IMPL = True
-except Exception:
-    _HAS_TRITON_IMPL = False
-
-
-def _require_triton_cuda():
-    if not _HAS_TRITON_IMPL:
-        raise RuntimeError(
-            "flash_kmeans Triton kernels are not available. "
-            "Ensure the package modules are importable."
-        )
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to run the Triton-backed k-means implementation.")
+from . import ops
 
 
 class FlashKMeans:
     """
-    Fast batched K-Means clustering implemented with Triton GPU kernels.
+    Fast batched K-Means clustering implemented with C++/CUDA kernels.
 
     Parameters
     ----------
@@ -39,25 +29,22 @@ class FlashKMeans:
     tol : float, default=1e-8
         Convergence tolerance on centroid shift.
     use_triton : bool, default=True
-        Whether to use triton implementation. If False, falls back to PyTorch implementation.
+        Kept for API compatibility.  The backend is always the C++/CUDA core.
     seed : int, default=0
         Random seed for centroid initialization.
     chunk_size_data : int, default=32768
-        Only used when fallback to PyTorch implementation.
-        Chunk size along the data dimension for assignment/update steps.
+        Kept for API compatibility (the C++ kernel manages its own tiling).
     chunk_size_centroids : int, default=1024
-        Only used when fallback to PyTorch implementation.
-        Chunk size along the centroid dimension for assignment/update steps.
+        Kept for API compatibility.
     chunk_size_data_cpu : int, default=1048576
-        Only when n_samples is too large to fit into GPU memory, this parameter controls
-        the chunk size of n_samples when copying data from CPU to GPU in chunks.
+        Chunk size along n_samples when streaming CPU data to the GPU.
     verbose : bool, default=False
         Whether to print per-iteration info.
     dtype : torch.dtype, optional
-        Compute Data type for algorithm.
+        Compute dtype for the algorithm.
     device : torch.device | None
-        Target device. Defaults to "cuda:0" when available.
-        Currently, only CUDA devices are supported.
+        Target device. None means "cuda:0" for in-memory data and all visible
+        GPUs for the large-N streaming path.
     """
 
     def __init__(
@@ -87,21 +74,21 @@ class FlashKMeans:
         self.verbose = bool(verbose)
         self.dtype = dtype
 
-        if self.use_triton:
-            try:
-                _require_triton_cuda()
-            except RuntimeError as e:
-                Warning(f"Falling back to PyTorch implementation: {e}")
-                self.use_triton = False
-
-        # Store raw device for largeN multi-GPU path (None = auto-detect all GPUs)
         self._raw_device = device
-        # default device for single-GPU / in-memory paths
         if device is None:
-            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(
+                "cuda:0" if torch.cuda.is_available() else "cpu"
+            )
         else:
-            self.device = device
+            self.device = torch.device(device)
 
+        self.centroids_b: Optional[torch.Tensor] = None
+        self.cluster_ids_b: Optional[torch.Tensor] = None
+        self._batch_size: Optional[int] = None
+
+    # ------------------------------------------------------------------
+    # fitting
+    # ------------------------------------------------------------------
 
     def train(self, data: torch.Tensor):
         """
@@ -110,178 +97,121 @@ class FlashKMeans:
         Parameters
         ----------
         data : torch.Tensor
-            Accepts Shape:
-            - (n_samples, n_features)
-            - (batch_size, n_samples, n_features)
-
-            if data is from GPU, it will process directly on GPU.
-            if data is from CPU, it will copy & process data on GPU by chunk_size_data_cpu.
-
+            Shape (n_samples, n_features) or (batch_size, n_samples, n_features).
+            CPU tensors larger than ``chunk_size_data_cpu`` are streamed to the
+            GPU in chunks (``kmeans_largeN`` path).
         """
-
         if data.ndim == 2:
             N, D = data.shape
             B = None
-            x_b = data.unsqueeze(0)  # (1, N, D)
+            x_b = data.unsqueeze(0)
         elif data.ndim == 3:
             B, N, D = data.shape
             x_b = data
         else:
-            raise ValueError("data must be of shape (n_samples, n_features) or (batch_size, n_samples, n_features)")
-
-        # Set random seed
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
+            raise ValueError(
+                "data must be of shape (n_samples, n_features) or "
+                "(batch_size, n_samples, n_features)"
+            )
 
         if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
-            # handle for large N on CPU
             assert B is None, "Batched data with large N on CPU is not supported yet."
-            assert self.use_triton, "process large N data requires triton implementation." 
-            cluster_ids_b, centroids_b  = kmeans_largeN(
+            labels, centroids = ops.kmeans_largeN(
                 x_b[0],
                 self.k,
                 max_iters=self.niter,
                 tol=self.tol,
                 verbose=self.verbose,
-                dtype=self.dtype,
                 BLOCK_N=self.chunk_size_data_cpu,
                 device=self._raw_device,
+                dtype=self.dtype,
+                seed=self.seed,
             )
-            centroids_b.unsqueeze_(0)
-            cluster_ids_b.unsqueeze_(0)
+            self.cluster_ids_b = labels.unsqueeze_(0)
+            self.centroids_b = centroids.unsqueeze_(0)
         else:
-            # Ensure CUDA + dtype
             compute_dtype = self.dtype or x_b.dtype
             x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
+            labels_b, centroids_b, _ = ops.batch_kmeans_Euclid(
+                x_b,
+                self.k,
+                max_iters=self.niter,
+                tol=self.tol,
+                init_centroids=None,
+                verbose=self.verbose,
+                seed=self.seed,
+            )
+            self.cluster_ids_b = labels_b
+            self.centroids_b = centroids_b
 
-            if self.use_triton:
-                # Run batched Triton KMeans (Euclidean)
-                cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid(
-                    x_b,
-                    self.k,
-                    max_iters=self.niter,
-                    tol=self.tol,
-                    init_centroids=None,
-                    verbose=self.verbose,
-                )
-            else:
-                # Run batched PyTorch KMeans (Euclidean)
-                cluster_ids_b, centroids_b, _ = batch_kmeans_Euclid_torch_native(
-                    x_b,
-                    self.k,
-                    max_iters=self.niter,
-                    tol=self.tol,
-                    init_centroids=None,
-                    verbose=self.verbose,
-                    chunk_size_N=self.chunk_size_data,
-                    chunk_size_K=self.chunk_size_centroids,
-                )
- 
-        self.centroids_b = centroids_b
-        self.cluster_ids_b = cluster_ids_b
         self._batch_size = B
+        return self
 
     def fit(self, data: torch.Tensor):
         """Alias for train; returns self."""
-        self.train(data)
-        return self
+        return self.train(data)
 
-    def predict(self, data: torch.Tensor) -> torch.LongTensor:
+    # ------------------------------------------------------------------
+    # inference
+    # ------------------------------------------------------------------
+
+    def predict(self, data: torch.Tensor) -> torch.Tensor:
         """
-        Assign each point to the nearest centroid using the Triton assign kernel.
+        Assign each point to the nearest centroid.
 
         Parameters
         ----------
         data : torch.Tensor
-            Accepts Shape:
-            - (n_samples, n_features)
-            - (batch_size, n_samples, n_features)
-
-        If model was trained batched (batch_size>1), prediction must be provided with the same batch_size.
+            Shape (n_samples, n_features) or (batch_size, n_samples, n_features).
+            If the model was trained batched (batch_size > 1), the same batch
+            size is required.
         """
-
         if self.centroids_b is None:
             raise RuntimeError("Model not trained. Call train() or fit() first.")
 
-        # Normalize input shape
         if data.ndim == 2:
             B = None
             N, D = data.shape
-            x_b = data.unsqueeze(0)  # (1, N, D)
+            x_b = data.unsqueeze(0)
         elif data.ndim == 3:
             B, N, D = data.shape
             x_b = data
         else:
-            raise ValueError("data must be of shape (n_samples, n_features) or (batch_size, n_samples, n_features)")
+            raise ValueError(
+                "data must be of shape (n_samples, n_features) or "
+                "(batch_size, n_samples, n_features)"
+            )
 
         if B != self._batch_size:
             raise ValueError(
                 f"Model was trained with batch size B={self._batch_size}, "
                 f"but predict received B={B}. Provide matching batch size."
             )
-        
+
         if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
-            # handle for large N on CPU
             assert B is None, "Batched data with large N on CPU is not supported yet."
-            assert self.use_triton, "process large N data requires triton implementation." 
-            labels = kmeans_largeN_assign(
+            return ops.kmeans_largeN_assign(
                 x_b[0],
                 self.centroids_b[0],
                 dtype=self.dtype,
                 BLOCK_N=self.chunk_size_data_cpu,
                 device=self._raw_device,
             )
-            return labels  # (N,)
-    
-        # Prepare tensors for kernel call
-        compute_dtype = self.dtype or x_b.dtype 
+
+        compute_dtype = self.dtype or x_b.dtype
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
- 
-        # Chunked to avoid materializing a full (B, N, D) temp.
-        N_ = x_b.shape[1]
-        x_sq = torch.empty(x_b.shape[:-1], device=x_b.device, dtype=x_b.dtype)
-        _CHUNK = 1 << 20
-        for i in range(0, N_, _CHUNK):
-            x_sq[:, i:i + _CHUNK] = (x_b[:, i:i + _CHUNK] ** 2).sum(dim=-1)
-
-        if self.use_triton:
-            # Call Triton assignment kernel
-            labels_b = euclid_assign_triton(x_b, self.centroids_b, x_sq)
-        else:
-            # Call PyTorch assignment fallback
-            labels_b = euclid_assign_torch_native_chunked(
-                x_b,
-                self.centroids_b,
-                x_sq,
-                chunk_size_N=self.chunk_size_data,
-                chunk_size_K=self.chunk_size_centroids,
-            )
-
+        labels_b = ops.euclid_assign_triton(x_b, self.centroids_b)
         if B is None:
-            return labels_b.squeeze(0)  # (N,)
-        return labels_b  # (B, N)
+            return labels_b.squeeze(0)
+        return labels_b
 
-    def fit_predict(self, data: torch.Tensor) -> torch.tensor:
+    def fit_predict(self, data: torch.Tensor) -> torch.Tensor:
         """
-        Fit KMeans on data and store centroids.
+        Fit KMeans on data and return the cluster labels.
 
-        Parameters
-        ----------
-        data : torch.Tensor
-            Input data for clustering.
-            data shape accepts:
-            - (n_samples, n_features)
-            - (batch_size, n_samples, n_features)
-
-        
-        Returns
-        -------
-        labels : torch.LongTensor (int64)
-            Shape depending on input:
-            - (n_samples,) if input was (n_samples, n_features)
-            - (batch_size, n_samples) if input was (batch_size, n_samples, n_features)
-
+        Returns (n_samples,) for 2D input and (batch_size, n_samples) for 3D.
         """
-        # cluster_ids: (B, N)
         self.train(data)
-        return self.cluster_ids_b.squeeze(0) if self._batch_size is None else self.cluster_ids_b
+        if self._batch_size is None:
+            return self.cluster_ids_b.squeeze(0)
+        return self.cluster_ids_b
