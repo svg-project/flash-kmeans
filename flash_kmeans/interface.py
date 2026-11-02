@@ -57,7 +57,7 @@ class FlashKMeans:
         Compute Data type for algorithm.
     device : torch.device | None
         Target device. Defaults to "cuda:0" when available.
-        Currently, only CUDA devices are supported.
+        Ascend devices are supported for in-memory Euclidean clustering.
     """
 
     def __init__(
@@ -87,7 +87,8 @@ class FlashKMeans:
         self.verbose = bool(verbose)
         self.dtype = dtype
 
-        if self.use_triton:
+        target_is_npu = device is not None and torch.device(device).type == "npu"
+        if self.use_triton and not target_is_npu:
             try:
                 _require_triton_cuda()
             except RuntimeError as e:
@@ -133,7 +134,7 @@ class FlashKMeans:
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
-        if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
+        if data.device.type == "cpu" and N > self.chunk_size_data_cpu and torch.device(self.device).type != "npu":
             # handle for large N on CPU
             assert B is None, "Batched data with large N on CPU is not supported yet."
             assert self.use_triton, "process large N data requires triton implementation." 
@@ -220,7 +221,7 @@ class FlashKMeans:
                 f"but predict received B={B}. Provide matching batch size."
             )
         
-        if data.device.type == "cpu" and N > self.chunk_size_data_cpu:
+        if data.device.type == "cpu" and N > self.chunk_size_data_cpu and torch.device(self.device).type != "npu":
             # handle for large N on CPU
             assert B is None, "Batched data with large N on CPU is not supported yet."
             assert self.use_triton, "process large N data requires triton implementation." 
@@ -236,6 +237,11 @@ class FlashKMeans:
         # Prepare tensors for kernel call
         compute_dtype = self.dtype or x_b.dtype 
         x_b = x_b.to(device=self.device, dtype=compute_dtype, copy=False)
+
+        if self.use_triton and x_b.device.type == "npu":
+            from .ascend import assign
+            labels_b = assign(x_b, self.centroids_b)
+            return labels_b.squeeze(0) if B is None else labels_b
  
         # Chunked to avoid materializing a full (B, N, D) temp.
         N_ = x_b.shape[1]

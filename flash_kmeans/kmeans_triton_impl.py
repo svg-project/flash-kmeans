@@ -76,6 +76,11 @@ def batch_kmeans_Euclid(
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
+    if x.device.type == "npu":
+        from .ascend import batch_kmeans_Euclid as ascend_kmeans
+        return ascend_kmeans(x, n_clusters, max_iters, tol, init_centroids,
+                             verbose, use_heuristic=use_heuristic)
+
     B, N, D = x.shape
 
     # Pre-compute squared L2 norm of all points (constant during iterations).
