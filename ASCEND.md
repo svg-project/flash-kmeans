@@ -96,6 +96,40 @@ in FP32. Across the three processes, tuned FP16 times range from 742.66 to
 749.82 ms for uniform inputs and 765.18 to 773.30 ms for 90% dominance; default
 backend times range from 273.74 to 274.60 ms and 274.60 to 274.79 ms respectively.
 
+## Wan attention features
+
+The public Wan2.1-1.3B model supplies 27 post-RoPE query tensors from three
+prompts, layers 0/12/24, and sampling steps 0/10/19. Generation uses 20 steps,
+81 frames at 480 by 832, and seeds 3100–3102. Four heads per tensor produce
+`[4, 32760, 128]` inputs, converted from BF16 to FP16 for every clustering path.
+Ten complete iterations with 1,000 centers and three independent initialization
+seeds per tensor produce these averages over 81 tensor/seed combinations:
+
+| Implementation | Ten iterations (ms) | Peak allocation (MiB) |
+|---|---:|---:|
+| Tuned PyTorch FP16 | 65.33 | 164.11 |
+| Tuned PyTorch FP32 | 79.10 | 164.11 |
+| Streaming, one stripe | 36.08 | 40.95 |
+| Streaming, eight stripes | 36.21 | 54.16 |
+
+The paired geometric-mean speedup over FP16 PyTorch is 1.81 times, with a
+1.72–1.88 range. The maximum relative objective difference from FP32 PyTorch
+is `5.02e-5`. The largest observed cluster occupies 0.443% of tokens.
+
+Feature collection additionally requires diffusers 0.38.0, accelerate,
+sentencepiece, and the public checkpoint downloaded locally:
+
+```bash
+python examples/collect_wan_features.py --model models/Wan2.1-T2V-1.3B-Diffusers
+python examples/benchmark_ascend.py \
+    --features features/wan/prompt0_step0_layer0.pt --shape 4 32760 128 1000 \
+    --iterations 10 --repeats 1 --seed 917 --torch-config 2048 1024 4 \
+    --variants torch_fp16 torch_fp32 packed_single striped \
+    --output results/wan_prompt0_step0_layer0_seed917.json
+```
+
+Repeat the clustering command for each collected tensor and seeds 917–919.
+
 ## Limitations
 
 The backend requires inputs and centers to fit in NPU memory. The CUDA
